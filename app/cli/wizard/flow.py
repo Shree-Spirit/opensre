@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import getpass
 import sys
 from dataclasses import dataclass
 
+import questionary
+from questionary import Style
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -26,6 +27,19 @@ from app.integrations.store import upsert_integration
 
 _console = Console()
 
+_STYLE = Style(
+    [
+        ("qmark", "fg:cyan bold"),
+        ("question", "bold"),
+        ("answer", "fg:cyan bold"),
+        ("pointer", "fg:cyan bold"),
+        ("highlighted", "fg:cyan bold"),
+        ("selected", "fg:green"),
+        ("separator", "fg:cyan"),
+        ("instruction", "fg:#858585 italic"),
+    ]
+)
+
 
 @dataclass(frozen=True)
 class Choice:
@@ -40,82 +54,51 @@ def _step(title: str) -> None:
     _console.rule(f"[bold cyan]{title}[/]")
 
 
-def _render_choice_table(prompt: str, choices: list[Choice], default: str | None) -> None:
-    _console.print(f"\n[bold]{prompt}[/]")
-    table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
-    table.add_column("#", style="cyan", no_wrap=True)
-    table.add_column("Option", style="white")
-    table.add_column("Group", style="dim", no_wrap=True)
-    table.add_column("Default", style="green", no_wrap=True)
-
-    for index, choice in enumerate(choices, start=1):
-        table.add_row(
-            str(index),
-            choice.label,
-            choice.group or "-",
-            "yes" if choice.value == default else "",
-        )
-    _console.print(table)
-    if default:
-        _console.print("[dim]Press Enter to accept the default.[/]")
-
-
 def _choose(prompt: str, choices: list[Choice], *, default: str | None = None) -> str:
-    _render_choice_table(prompt, choices, default)
-    indexed_values: dict[str, str] = {}
-    for index, choice in enumerate(choices, start=1):
-        indexed_values[str(index)] = choice.value
+    default_label: str | None = None
+    q_choices = []
+    for choice in choices:
+        suffix = f" ({choice.group})" if choice.group else ""
+        label = f"{choice.label}{suffix}"
+        q_choices.append(questionary.Choice(title=label, value=choice.value))
+        if choice.value == default:
+            default_label = label
 
-    prompt_suffix = f" [{default}]" if default else ""
-    while True:
-        raw_value = input(f"  Enter choice{prompt_suffix}: ").strip()
-        if not raw_value and default:
-            return default
-        selected = indexed_values.get(raw_value)
-        if selected:
-            return selected
-        _console.print("[red]  Invalid choice. Please try again.[/]")
+    result = questionary.select(
+        prompt,
+        choices=q_choices,
+        default=default_label,
+        style=_STYLE,
+        instruction="(use arrow keys)",
+    ).ask()
+
+    if result is None:
+        raise KeyboardInterrupt
+    return str(result)
 
 
 def _choose_many(prompt: str, choices: list[Choice]) -> list[str]:
-    _render_choice_table(prompt, choices, default=None)
-    _console.print("[dim]Enter comma-separated numbers, or press Enter to skip.[/]")
+    q_choices = [
+        questionary.Choice(title=choice.label, value=choice.value) for choice in choices
+    ]
 
-    indexed_values = {str(index): choice.value for index, choice in enumerate(choices, start=1)}
-    while True:
-        raw_value = input("  Enter choices: ").strip()
-        if not raw_value:
-            return []
+    result = questionary.checkbox(
+        prompt,
+        choices=q_choices,
+        style=_STYLE,
+        instruction="(space to toggle, enter to confirm)",
+    ).ask()
 
-        parts = [part.strip() for part in raw_value.split(",") if part.strip()]
-        selected_values: list[str] = []
-        invalid = False
-        for part in parts:
-            selected = indexed_values.get(part)
-            if not selected:
-                invalid = True
-                break
-            if selected not in selected_values:
-                selected_values.append(selected)
-
-        if selected_values and not invalid:
-            return selected_values
-        _console.print("[red]  Invalid selection. Please use comma-separated numbers from the table.[/]")
+    if result is None:
+        raise KeyboardInterrupt
+    return list(result)
 
 
 def _confirm(prompt: str, *, default: bool = True) -> bool:
-    default_hint = "Y/n" if default else "y/N"
-    accepted = {"y", "yes"}
-    rejected = {"n", "no"}
-    while True:
-        raw_value = input(f"{prompt} [{default_hint}]: ").strip().lower()
-        if not raw_value:
-            return default
-        if raw_value in accepted:
-            return True
-        if raw_value in rejected:
-            return False
-        _console.print("[red]Please answer y or n.[/]")
+    result = questionary.confirm(prompt, default=default, style=_STYLE).ask()
+    if result is None:
+        raise KeyboardInterrupt
+    return bool(result)
 
 
 def _prompt_value(
@@ -126,10 +109,15 @@ def _prompt_value(
     allow_empty: bool = False,
 ) -> str:
     while True:
-        hint = f" [{default}]" if default else ""
-        prompt = f"  {label}{hint}: "
-        value = getpass.getpass(prompt) if secret else input(prompt)
-        value = value.strip()
+        if secret:
+            result = questionary.password(f"  {label}", style=_STYLE).ask()
+        else:
+            result = questionary.text(f"  {label}", default=default, style=_STYLE).ask()
+
+        if result is None:
+            raise KeyboardInterrupt
+
+        value = str(result).strip()
         if value:
             return value
         if default:
@@ -141,7 +129,15 @@ def _prompt_value(
 
 def _prompt_api_key(provider: ProviderOption) -> str:
     while True:
-        value = getpass.getpass(f"\nEnter {provider.label} API key ({provider.api_key_env}): ").strip()
+        result = questionary.password(
+            f"Enter {provider.label} API key ({provider.api_key_env})",
+            style=_STYLE,
+        ).ask()
+
+        if result is None:
+            raise KeyboardInterrupt
+
+        value = str(result).strip()
         if value:
             return value
         _console.print("[red]API key is required.[/]")

@@ -1,16 +1,42 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from app.cli.wizard import flow
 from app.cli.wizard.probes import ProbeResult
 from app.cli.wizard.validation import ValidationResult
 
 
 def test_run_wizard_advanced_remote_falls_back_to_local(monkeypatch, tmp_path, capsys) -> None:
-    responses = iter(["2", "2", "y", "", "", ""])
+    select_responses = iter(["advanced", "remote", "anthropic", "claude-opus-4-20250514"])
+    confirm_responses = iter([True])
+
+    def _mock_select(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(select_responses)
+        return m
+
+    def _mock_confirm(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(confirm_responses)
+        return m
+
+    def _mock_checkbox(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = []
+        return m
+
+    def _mock_password(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = "secret-key"
+        return m
+
     saved: dict[str, object] = {}
 
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(responses))
-    monkeypatch.setattr(flow.getpass, "getpass", lambda _prompt="": "secret-key")
+    monkeypatch.setattr(flow.questionary, "select", _mock_select)
+    monkeypatch.setattr(flow.questionary, "confirm", _mock_confirm)
+    monkeypatch.setattr(flow.questionary, "checkbox", _mock_checkbox)
+    monkeypatch.setattr(flow.questionary, "password", _mock_password)
     monkeypatch.setattr(flow, "get_store_path", lambda: tmp_path / "opensre.json")
     monkeypatch.setattr(flow, "probe_local_target", lambda _path: ProbeResult("local", True, "ok"))
     monkeypatch.setattr(flow, "probe_remote_target", lambda: ProbeResult("remote", True, "remote ok"))
@@ -41,15 +67,12 @@ def test_run_wizard_advanced_remote_falls_back_to_local(monkeypatch, tmp_path, c
     assert saved["api_key"] == "secret-key"
 
     output = capsys.readouterr().out
-    assert "Remote configuration is not available yet." in output
     assert "Provider sample: OpenSRE ready" in output
     assert "Demo action response" in output
     assert "Saved configuration" in output
-    assert "config" in output
 
 
 def test_run_wizard_retries_invalid_api_key(monkeypatch, tmp_path, capsys) -> None:
-    responses = iter(["", "", "", ""])
     validations = iter(
         [
             ValidationResult(ok=False, detail="bad key"),
@@ -57,8 +80,26 @@ def test_run_wizard_retries_invalid_api_key(monkeypatch, tmp_path, capsys) -> No
         ]
     )
 
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(responses))
-    monkeypatch.setattr(flow.getpass, "getpass", lambda _prompt="": "secret-key")
+    select_responses = iter(["quickstart", "anthropic", "claude-opus-4-20250514"])
+
+    def _mock_select(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(select_responses)
+        return m
+
+    def _mock_checkbox(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = []
+        return m
+
+    def _mock_password(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = "secret-key"
+        return m
+
+    monkeypatch.setattr(flow.questionary, "select", _mock_select)
+    monkeypatch.setattr(flow.questionary, "checkbox", _mock_checkbox)
+    monkeypatch.setattr(flow.questionary, "password", _mock_password)
     monkeypatch.setattr(flow, "get_store_path", lambda: tmp_path / "opensre.json")
     monkeypatch.setattr(flow, "probe_local_target", lambda _path: ProbeResult("local", True, "ok"))
     monkeypatch.setattr(
@@ -84,13 +125,41 @@ def test_run_wizard_retries_invalid_api_key(monkeypatch, tmp_path, capsys) -> No
 
 
 def test_run_wizard_configures_optional_integrations(monkeypatch, tmp_path, capsys) -> None:
-    responses = iter(["", "", "", "1,3", "https://grafana.example.com"])
-    secrets = iter(["llm-secret", "grafana-token", "https://hooks.slack.com/services/T000/B000/abc"])
+    select_responses = iter(["quickstart", "anthropic", "claude-opus-4-20250514", "role"])
     saved_integrations: list[tuple[str, dict]] = []
     synced_env_values: list[dict[str, str]] = []
 
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(responses))
-    monkeypatch.setattr(flow.getpass, "getpass", lambda _prompt="": next(secrets))
+    def _mock_select(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(select_responses)
+        return m
+
+    def _mock_checkbox(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = ["grafana", "slack"]
+        return m
+
+    password_responses = iter([
+        "llm-secret",
+        "grafana-token",
+        "https://hooks.slack.com/services/T000/B000/abc",
+    ])
+    text_responses = iter(["https://grafana.example.com"])
+
+    def _mock_password(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(password_responses)
+        return m
+
+    def _mock_text(*_args, **_kwargs):
+        m = MagicMock()
+        m.ask.return_value = next(text_responses)
+        return m
+
+    monkeypatch.setattr(flow.questionary, "select", _mock_select)
+    monkeypatch.setattr(flow.questionary, "checkbox", _mock_checkbox)
+    monkeypatch.setattr(flow.questionary, "password", _mock_password)
+    monkeypatch.setattr(flow.questionary, "text", _mock_text)
     monkeypatch.setattr(flow, "get_store_path", lambda: tmp_path / "opensre.json")
     monkeypatch.setattr(flow, "probe_local_target", lambda _path: ProbeResult("local", True, "ok"))
     monkeypatch.setattr(
@@ -115,11 +184,7 @@ def test_run_wizard_configures_optional_integrations(monkeypatch, tmp_path, caps
         synced_env_values.append(values)
         return tmp_path / ".env"
 
-    monkeypatch.setattr(
-        flow,
-        "sync_env_values",
-        _sync_env_values,
-    )
+    monkeypatch.setattr(flow, "sync_env_values", _sync_env_values)
     monkeypatch.setattr(
         flow,
         "upsert_integration",
@@ -156,6 +221,4 @@ def test_run_wizard_configures_optional_integrations(monkeypatch, tmp_path, caps
     ]
 
     output = capsys.readouterr().out
-    assert "Optional integrations" in output
-    assert "integrations" in output
     assert "Grafana, Slack" in output

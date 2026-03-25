@@ -30,6 +30,7 @@ python-dotenv>=1.0.0
 dotenv
 click>=8.1.0  # CLI framework with tab-completion support
 rich>=13.0.0  # For pretty terminal output
+questionary>=2.1.0  # Interactive arrow-key CLI prompts
 boto3
 PyYAML>=6.0
 

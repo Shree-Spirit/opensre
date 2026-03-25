@@ -12,10 +12,11 @@ Supported services: aws, grafana, datadog, slack, opensearch, rds, tracer
 
 from __future__ import annotations
 
-import getpass
 import json
 import sys
 from typing import Any
+
+import questionary
 
 from app.integrations.store import (
     STORE_PATH,
@@ -37,14 +38,18 @@ _SECRET_KEYS = frozenset({"api_key", "app_key", "password", "secret_access_key",
 
 
 def _p(label: str, default: str = "", secret: bool = False) -> str:
-    hint = f" [{default}]" if default else ""
-    prompt = f"  {_B}{label}{_R}{hint}: "
     try:
-        value = getpass.getpass(prompt) if secret else input(prompt).strip()
+        if secret:
+            result = questionary.password(f"  {label}").ask()
+        else:
+            result = questionary.text(f"  {label}", default=default).ask()
     except (EOFError, KeyboardInterrupt):
         print("\nAborted.")
         sys.exit(1)
-    return value or default
+    if result is None:
+        print("\nAborted.")
+        sys.exit(1)
+    return result.strip() or default
 
 
 def _die(msg: str) -> None:
@@ -80,8 +85,17 @@ def _setup_datadog() -> None:
 
 
 def _setup_aws() -> None:
-    print("  1) IAM Role ARN  2) Access Key + Secret")
-    choice = _p("Choice", default="1")
+    choice = questionary.select(
+        "AWS authentication method:",
+        choices=[
+            questionary.Choice("IAM Role ARN", value="1"),
+            questionary.Choice("Access Key + Secret", value="2"),
+        ],
+        instruction="(use arrow keys)",
+    ).ask()
+    if choice is None:
+        print("\nAborted.")
+        sys.exit(1)
     region = _p("Region", default="us-east-1")
     if choice == "1":
         role_arn = _p("IAM Role ARN")
@@ -105,9 +119,19 @@ def _setup_slack() -> None:
 
 def _setup_opensearch() -> None:
     endpoint = _p("Endpoint (e.g. https://my-cluster.us-east-1.es.amazonaws.com)")
-    print("  1) Username + Password  2) API key")
     creds: dict[str, Any] = {"endpoint": endpoint}
-    if _p("Choice", default="1") == "2":
+    auth_choice = questionary.select(
+        "OpenSearch authentication method:",
+        choices=[
+            questionary.Choice("Username + Password", value="1"),
+            questionary.Choice("API key", value="2"),
+        ],
+        instruction="(use arrow keys)",
+    ).ask()
+    if auth_choice is None:
+        print("\nAborted.")
+        sys.exit(1)
+    if auth_choice == "2":
         creds["api_key"] = _p("API key", secret=True)
     else:
         creds["username"] = _p("Username", default="admin")
@@ -185,10 +209,10 @@ def cmd_remove(service: str | None) -> None:
         _die("Usage: remove <service>")
         return
     try:
-        confirm = input(f"  Remove '{service}'? [y/N]: ").strip().lower()
+        confirmed = questionary.confirm(f"  Remove '{service}'?", default=False).ask()
     except (EOFError, KeyboardInterrupt):
         return
-    if confirm not in ("y", "yes"):
+    if not confirmed:
         print("  Cancelled.")
         return
     if remove_integration(service):
