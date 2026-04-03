@@ -309,15 +309,30 @@ See [SECURITY.md](SECURITY.md) for responsible disclosure.
 
 `opensre` collects anonymous usage statistics with Posthog to help us understand adoption
 and demonstrate traction to sponsors and investors who fund the project.
-What we collect: command name, CLI version, Python version, and OS family.
-A randomly generated anonymous ID is created on first run and stored in
-`~/.config/opensre/`. We never collect alert contents, hostnames,
-credentials, or any personally identifiable information.
+What we collect: command name, success/failure, rough runtime, CLI version,
+Python version, OS family, machine architecture, and a small amount of
+command-specific metadata such as which subcommand ran. For `opensre onboard`
+and `opensre investigate`, we may also collect the selected model/provider and
+whether the command used flags such as `--interactive` or `--input`.
 
-To opt out, set the environment variable before running:
+A randomly generated anonymous ID is created on first run and stored in
+`~/.config/opensre/`. We never collect alert contents, file contents,
+hostnames, credentials, or any personally identifiable information.
+
+Telemetry is automatically disabled in GitHub Actions and pytest runs.
+
+To opt out locally, set the environment variable before running:
 
 ```bash
 export OPENSRE_NO_TELEMETRY=1
+```
+
+The legacy alias `OPENSRE_ANALYTICS_DISABLED=1` also still works.
+
+To inspect the payload locally without sending anything, use:
+
+```bash
+export OPENSRE_TELEMETRY_DEBUG=1
 ```
 
 ## License

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
+import json
 import os
 import platform
-import queue
-import threading
+import sys
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -34,31 +32,37 @@ _CI_ENV_VARS: Final[tuple[str, ...]] = (
     "JENKINS_URL",
     "TEAMCITY_VERSION",
 )
+_DEBUG_PREFIX = "[telemetry]"
+_SEND_TIMEOUT = 1.0
 
-_QUEUE_SIZE = 128
-_SEND_TIMEOUT = 2.0
-_SHUTDOWN_WAIT = 1.0
-
-type PropertyValue = str | bool
+type PropertyValue = str | bool | int
 type Properties = dict[str, PropertyValue]
 
 
-@dataclass(frozen=True, slots=True)
-class _Envelope:
-    event: str
-    properties: Properties
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "") not in ("", "0", "false", "False")
 
 
 def _is_ci_environment() -> bool:
-    return any(os.getenv(name, "") not in ("", "0", "false", "False") for name in _CI_ENV_VARS)
+    return any(_env_truthy(name) for name in _CI_ENV_VARS)
+
+
+def _is_test_environment() -> bool:
+    return _env_truthy("PYTEST_CURRENT_TEST")
 
 
 def _is_opted_out() -> bool:
     return (
-        os.getenv("OPENSRE_ANALYTICS_DISABLED", "0") == "1"
-        or os.getenv("DO_NOT_TRACK", "0") == "1"
+        _env_truthy("OPENSRE_NO_TELEMETRY")
+        or _env_truthy("OPENSRE_ANALYTICS_DISABLED")
+        or _env_truthy("DO_NOT_TRACK")
+        or _is_test_environment()
         or _is_ci_environment()
     )
+
+
+def _is_debug_enabled() -> bool:
+    return _env_truthy("OPENSRE_TELEMETRY_DEBUG")
 
 
 def _get_or_create_anonymous_id() -> str:
@@ -90,123 +94,48 @@ def _cli_version() -> str:
     return get_version()
 
 
-_BASE_PROPERTIES: Final[Properties] = {
-    "cli_version": _cli_version(),
-    "python_version": platform.python_version(),
-    "os_family": platform.system().lower(),
-    "os_version": platform.release(),
-    "machine_arch": platform.machine().lower(),
-    "$process_person_profile": False,
-}
+def _base_properties() -> Properties:
+    return {
+        "cli_version": _cli_version(),
+        "python_version": platform.python_version(),
+        "os_family": platform.system().lower(),
+        "os_version": platform.release(),
+        "machine_arch": platform.machine().lower(),
+        "$process_person_profile": False,
+    }
 
 
-class Analytics:
-    def __init__(self) -> None:
-        self._disabled = _is_opted_out()
-        self._anonymous_id = "disabled" if self._disabled else _get_or_create_anonymous_id()
-        self._queue: queue.Queue[_Envelope | None] = queue.Queue(maxsize=_QUEUE_SIZE)
-        self._pending_lock = threading.Lock()
-        self._pending = 0
-        self._drained = threading.Event()
-        self._drained.set()
-        self._worker: threading.Thread | None = None
-        self._shutdown = False
+def _build_payload(event: Event, properties: Properties | None = None) -> dict[str, object] | None:
+    if _is_opted_out():
+        return None
 
-        if not self._disabled:
-            atexit.register(self.shutdown)
-
-    def capture(self, event: Event, properties: Properties | None = None) -> None:
-        if self._disabled or self._shutdown:
-            return
-        envelope = _Envelope(
-            event=event.value,
-            properties=_BASE_PROPERTIES | (properties or {}),
-        )
-        self._ensure_worker()
-        try:
-            with self._pending_lock:
-                self._pending += 1
-                self._drained.clear()
-            self._queue.put_nowait(envelope)
-        except queue.Full:
-            self._mark_done()
-
-    def shutdown(self, *, flush: bool = True, timeout: float = _SHUTDOWN_WAIT) -> None:
-        if self._disabled or self._shutdown:
-            return
-        self._shutdown = True
-        self._ensure_worker()
-        with contextlib.suppress(queue.Full):
-            self._queue.put_nowait(None)
-        if flush and self._worker is not None:
-            self._drained.wait(timeout=timeout)
-            self._worker.join(timeout=timeout)
-
-    def _ensure_worker(self) -> None:
-        if self._worker is not None:
-            return
-        worker = threading.Thread(target=self._worker_loop, name="opensre-analytics", daemon=True)
-        worker.start()
-        self._worker = worker
-
-    def _worker_loop(self) -> None:
-        with httpx.Client(timeout=_SEND_TIMEOUT) as client:
-            while True:
-                item = self._queue.get()
-                if item is None:
-                    self._queue.task_done()
-                    break
-                try:
-                    self._send(client, item)
-                finally:
-                    self._queue.task_done()
-                    self._mark_done()
-            # Drain anything queued before shutdown sentinel arrived.
-            while True:
-                try:
-                    item = self._queue.get_nowait()
-                except queue.Empty:
-                    return
-                try:
-                    if item is not None:
-                        self._send(client, item)
-                finally:
-                    self._queue.task_done()
-                    self._mark_done()
-
-    def _send(self, client: httpx.Client, item: _Envelope) -> None:
-        payload = {
-            "api_key": _POSTHOG_API_KEY,
-            "event": item.event,
-            "properties": {
-                "distinct_id": self._anonymous_id,
-                "$lib": "opensre-cli",
-                **item.properties,
-            },
-        }
-        with contextlib.suppress(Exception):
-            client.post(f"{_POSTHOG_HOST}/capture/", json=payload).raise_for_status()
-
-    def _mark_done(self) -> None:
-        with self._pending_lock:
-            self._pending = max(0, self._pending - 1)
-            if self._pending == 0:
-                self._drained.set()
+    return {
+        "api_key": _POSTHOG_API_KEY,
+        "event": event.value,
+        "properties": {
+            "distinct_id": _get_or_create_anonymous_id(),
+            "$lib": "opensre-cli",
+            **_base_properties(),
+            **(properties or {}),
+        },
+    }
 
 
-_instance: Analytics | None = None
+def _debug_log(payload: dict[str, object]) -> None:
+    print(f"{_DEBUG_PREFIX} {json.dumps(payload, sort_keys=True)}", file=sys.stderr)
 
 
-def get_analytics() -> Analytics:
-    global _instance  # noqa: PLW0603
-    if _instance is None:
-        _instance = Analytics()
-    return _instance
+def capture(event: Event, properties: Properties | None = None) -> None:
+    payload = _build_payload(event, properties)
+    if payload is None:
+        return
 
+    if _is_debug_enabled():
+        _debug_log(payload)
+        return
 
-def shutdown_analytics(*, flush: bool = True) -> None:
-    if _instance is not None:
-        _instance.shutdown(flush=flush)
+    with contextlib.suppress(Exception):
+        httpx.post(f"{_POSTHOG_HOST}/capture/", json=payload, timeout=_SEND_TIMEOUT).raise_for_status()
 
 
 def mark_install_detected() -> None:
@@ -221,4 +150,10 @@ def capture_first_run_if_needed() -> None:
     if _is_opted_out():
         return
     if _touch_once(_FIRST_RUN_PATH):
-        get_analytics().capture(Event.INSTALL_DETECTED)
+        capture(
+            Event.INSTALL_DETECTED,
+            {
+                "install_source": "first_run",
+                "entrypoint": "opensre",
+            },
+        )

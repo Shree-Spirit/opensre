@@ -913,22 +913,12 @@ def _configure_selected_integrations() -> tuple[list[str], str | None]:
         label, env_path = handlers[selected_service]()
         configured.append(label)
         last_env_path = env_path
-        _track_integration_added(selected_service)
     except KeyboardInterrupt:
         _console.print(
             f"[yellow]{_SERVICE_LABELS.get(selected_service, selected_service)} setup skipped.[/]"
         )
 
     return configured, last_env_path
-
-
-def _track_integration_added(service: str) -> None:
-    try:
-        from app.analytics.cli import capture_integration_added
-
-        capture_integration_added(service)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _render_demo_response(demo_response: dict) -> None:

@@ -1,21 +1,13 @@
 """Analytics exports."""
 
-from app.analytics.cli import capture_integration_added
+from app.analytics.cli import capture_command_completed
 from app.analytics.events import Event
-from app.analytics.provider import (
-    Analytics,
-    Properties,
-    PropertyValue,
-    get_analytics,
-    shutdown_analytics,
-)
+from app.analytics.provider import Properties, PropertyValue, capture
 
 __all__ = [
-    "Analytics",
     "Event",
     "Properties",
     "PropertyValue",
-    "capture_integration_added",
-    "get_analytics",
-    "shutdown_analytics",
+    "capture",
+    "capture_command_completed",
 ]
