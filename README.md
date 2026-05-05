@@ -1277,6 +1277,13 @@ Thanks goes to these amazing people:
             <sub><b>vidhishah2209</b></sub>
         </a>
     </td>
+            <td align="center">
+        <a href="https://github.com/aayushprsingh">
+            <img src="https://avatars.githubusercontent.com/u/172073271?v=4" width="100" alt="aayushprsingh"/>
+            <br />
+            <sub><b>aayushprsingh</b></sub>
+        </a>
+    </td>
 		</tr>
 	</tbody>
 </table>
