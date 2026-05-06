@@ -176,7 +176,7 @@ def _install_sigint_handler() -> None:
     covers everything else: long-running operations, streaming output, etc.
     """
 
-    def _handler(signum: int, frame: object) -> None:  # noqa: ARG001
+    def _handler(_signum: int, _frame: object) -> None:
         handle_ctrl_c_press()
 
     signal.signal(signal.SIGINT, _handler)

@@ -322,10 +322,6 @@ def _compute_anonymous_identity() -> _AnonymousIdentity:
         return _AnonymousIdentity(str(uuid.uuid4()), "none")
 
 
-def _compute_anonymous_id() -> str:
-    return _compute_anonymous_identity().distinct_id
-
-
 def _get_or_create_anonymous_id() -> str:
     global _cached_anonymous_id, _cached_identity_persistence  # noqa: PLW0603
     if _cached_anonymous_id is not None:
