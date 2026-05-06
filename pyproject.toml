@@ -153,3 +153,10 @@ ignore_names = [
   "version_check", "deep_health_check",
   "investigate_stream",
 ]
+
+# uv installs this PEP 735 group by default (`uv sync`; omit with `--no-dev`).
+# `pre-commit` is also under `[project.optional-dependencies] dev` for `pip install .[dev]`.
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0.0",
+]

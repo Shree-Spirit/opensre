@@ -2187,6 +2187,11 @@ postgresql = [
     { name = "psycopg2-binary" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pre-commit" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
@@ -2251,6 +2256,9 @@ requires-dist = [
     { name = "tzdata", specifier = ">=2026.1" },
 ]
 provides-extras = ["dev", "opensre-hub", "kafka", "clickhouse", "postgresql", "azure-sql"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pre-commit", specifier = ">=4.0.0" }]
 
 [[package]]
 name = "opentelemetry-api"
