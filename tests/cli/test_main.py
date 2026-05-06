@@ -366,7 +366,7 @@ def test_main_captures_cli_invoked_before_reported_subcommand_families(
         )
     else:
         tests_module = importlib.import_module("app.cli.commands.tests")
-        monkeypatch.setattr(setup, lambda: _EmptyCatalog())
+        monkeypatch.setattr(setup, _EmptyCatalog)
 
         def _capture_tests_listed(_category: str, *, search: bool) -> None:
             _ = (_category, search)
