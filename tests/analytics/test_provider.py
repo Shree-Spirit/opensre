@@ -122,6 +122,73 @@ def test_capture_install_detected_initializes_identity_before_install_marker(
     assert events == [Event.INSTALL_DETECTED.value]
 
 
+def test_analytics_send_failure_is_reported_to_sentry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OPENSRE_ANALYTICS_DISABLED", raising=False)
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    monkeypatch.setattr(provider, "_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(provider, "_ANONYMOUS_ID_PATH", tmp_path / "anonymous_id")
+    monkeypatch.setattr(provider.atexit, "register", lambda _func: None)
+    captured_errors: list[BaseException] = []
+    expected_error = RuntimeError("posthog unavailable")
+
+    class _StubResponse:
+        def raise_for_status(self) -> None:
+            raise expected_error
+
+    class _StubClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def __enter__(self) -> _StubClient:
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb) -> None:
+            return None
+
+        def post(self, url: str, json: dict[str, object]) -> _StubResponse:
+            _ = (url, json)
+            return _StubResponse()
+
+    monkeypatch.setattr(provider.httpx, "Client", _StubClient)
+    monkeypatch.setattr(provider, "_capture_sentry_failure", captured_errors.append)
+
+    analytics = provider.get_analytics()
+    analytics.capture(Event.CLI_INVOKED)
+    provider.shutdown_analytics(flush=True)
+
+    assert captured_errors == [expected_error]
+
+
+def test_analytics_capture_failure_releases_pending_counter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OPENSRE_ANALYTICS_DISABLED", raising=False)
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    monkeypatch.setattr(provider, "_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(provider, "_ANONYMOUS_ID_PATH", tmp_path / "anonymous_id")
+    monkeypatch.setattr(provider.atexit, "register", lambda _func: None)
+    captured_errors: list[BaseException] = []
+    expected_error = RuntimeError("queue unavailable")
+
+    analytics = provider.get_analytics()
+    monkeypatch.setattr(analytics, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(
+        analytics._queue,
+        "put_nowait",
+        lambda _item: (_ for _ in ()).throw(expected_error),
+    )
+    monkeypatch.setattr(provider, "_capture_sentry_failure", captured_errors.append)
+
+    analytics.capture(Event.CLI_INVOKED)
+
+    assert analytics._pending == 0
+    assert analytics._drained.is_set()
+    assert captured_errors == [expected_error]
+    provider._instance = None
+
+
 def test_get_or_create_anonymous_id_reuses_persisted_value(monkeypatch, tmp_path: Path) -> None:
     anonymous_id_path = tmp_path / "anonymous_id"
 
@@ -876,3 +943,53 @@ def test_event_log_counter_increments_only_on_successful_write(monkeypatch, tmp_
         provider._log_debug_line("event")
 
     assert provider._event_log_state.lines_written == 7
+
+
+def test_capture_coerces_invalid_property_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """capture must accept str/bool, coerce numerics, drop None, and reject objects."""
+    monkeypatch.delenv("OPENSRE_ANALYTICS_DISABLED", raising=False)
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    monkeypatch.setattr(provider, "_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(provider, "_ANONYMOUS_ID_PATH", tmp_path / "anonymous_id")
+    monkeypatch.setattr(provider.atexit, "register", lambda _func: None)
+    posted_payloads = _stub_httpx_client(monkeypatch)
+
+    failure_lines: list[str] = []
+
+    def _record_failure(stage: str, error: BaseException, **extra: object) -> None:
+        failure_lines.append(f"{stage}:{type(error).__name__}:{extra}")
+
+    monkeypatch.setattr(provider, "_log_failure", _record_failure)
+
+    class _Custom:
+        def __repr__(self) -> str:
+            return "<custom>"
+
+    analytics = provider.Analytics()
+    analytics.capture(
+        Event.CLI_INVOKED,
+        {
+            "ok_string": "value",
+            "ok_bool": True,
+            "drop_none": None,
+            "coerce_int": 7,
+            "coerce_float": 1.5,
+            "drop_object": _Custom(),
+        },
+    )
+    analytics.shutdown(flush=True)
+
+    assert len(posted_payloads) == 1
+    properties = posted_payloads[0]["json"]["properties"]
+    assert properties["ok_string"] == "value"
+    assert properties["ok_bool"] is True
+    assert properties["coerce_int"] == "7"
+    assert properties["coerce_float"] == "1.5"
+    assert "drop_none" not in properties
+    assert "drop_object" not in properties
+
+    invalid = [line for line in failure_lines if line.startswith("invalid_property")]
+    assert any("drop_object" in line for line in invalid)
+    assert all("drop_none" not in line for line in invalid)

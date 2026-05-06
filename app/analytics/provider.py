@@ -624,8 +624,57 @@ def _log_failure(stage: str, error: BaseException, **extra: object) -> None:
     )
 
 
+def _capture_sentry_failure(error: BaseException) -> None:
+    """Report telemetry failures without making analytics depend on Sentry imports."""
+    try:
+        from app.utils.sentry_sdk import capture_exception
+    except Exception:  # noqa: BLE001
+        return
+    capture_exception(error)
+
+
 class _QueueOverflow(RuntimeError):
     """Synthetic exception used so ``queue.Full`` produces a useful breadcrumb."""
+
+
+class _InvalidPropertyValue(TypeError):
+    """Raised internally when a caller submits a property value we cannot serialize."""
+
+
+def _coerce_properties(
+    event: str,
+    properties: Properties | None,
+) -> Properties:
+    """Return a sanitized copy of ``properties`` enforcing the ``str | bool`` contract.
+
+    PostHog event values are typed as ``str | bool``; a buggy caller could still
+    pass a number, ``None``, or an arbitrary object. We accept ``str | bool``
+    as-is, drop ``None`` silently, coerce ``int`` and ``float`` to ``str``, and
+    drop anything else with a ``_log_failure`` breadcrumb so the misuse stays
+    observable without crashing capture.
+    """
+    if not properties:
+        return {}
+
+    coerced: Properties = {}
+    for key, value in properties.items():
+        if isinstance(value, bool | str):
+            coerced[key] = value
+        elif value is None:
+            continue
+        elif isinstance(value, int | float):
+            coerced[key] = str(value)
+        else:
+            _log_failure(
+                "invalid_property",
+                _InvalidPropertyValue(
+                    f"property {key!r} has unsupported type {type(value).__name__}"
+                ),
+                event=event,
+                property_key=key,
+                value_type=type(value).__name__,
+            )
+    return coerced
 
 
 _COMPOSITE_FINGERPRINT = _build_composite_fingerprint()
@@ -666,21 +715,26 @@ class Analytics:
             return
         envelope = _Envelope(
             event=event.value,
-            properties=_BASE_PROPERTIES | (properties or {}),
+            properties=_BASE_PROPERTIES | _coerce_properties(event.value, properties),
         )
-        self._ensure_worker()
+        pending_registered = False
         try:
+            self._ensure_worker()
             with self._pending_lock:
                 self._pending += 1
+                pending_registered = True
                 self._drained.clear()
             self._queue.put_nowait(envelope)
         except queue.Full:
             self._mark_done()
-            _log_failure(
-                "queue_full",
-                _QueueOverflow(f"queue overflow at size={_QUEUE_SIZE}"),
-                event=event.value,
-            )
+            error = _QueueOverflow(f"queue overflow at size={_QUEUE_SIZE}")
+            _log_failure("queue_full", error, event=event.value)
+            _capture_sentry_failure(error)
+        except Exception as exc:  # noqa: BLE001
+            if pending_registered:
+                self._mark_done()
+            _log_failure("capture", exc, event=event.value)
+            _capture_sentry_failure(exc)
 
     def shutdown(self, *, flush: bool = True, timeout: float = _SHUTDOWN_WAIT) -> None:
         if self._shutdown:
@@ -691,6 +745,7 @@ class Analytics:
                 self._ensure_worker()
             except Exception as exc:  # noqa: BLE001
                 _log_failure("worker_start", exc)
+                _capture_sentry_failure(exc)
                 self._worker_alive = False
         with contextlib.suppress(queue.Full):
             self._queue.put_nowait(None)
@@ -745,8 +800,11 @@ class Analytics:
             "event": item.event,
             "properties": properties,
         }
-        with contextlib.suppress(Exception):
+        try:
             client.post(f"{POSTHOG_HOST}/capture/", json=payload).raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            _log_failure("posthog_send", exc, event=item.event)
+            _capture_sentry_failure(exc)
 
     def _mark_done(self) -> None:
         with self._pending_lock:

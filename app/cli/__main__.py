@@ -16,8 +16,8 @@ import sys
 import click
 from dotenv import load_dotenv
 
-from app.analytics.cli import capture_cli_invoked
-from app.analytics.provider import capture_first_run_if_needed, shutdown_analytics
+from app.analytics.cli import build_cli_invoked_properties, capture_cli_invoked
+from app.analytics.provider import Properties, capture_first_run_if_needed, shutdown_analytics
 from app.cli.commands import register_commands
 from app.cli.support.layout import RichGroup, render_landing
 from app.cli.support.prompt_support import (
@@ -25,10 +25,71 @@ from app.cli.support.prompt_support import (
     install_questionary_ctrl_c_double_exit,
     install_questionary_escape_cancel,
 )
+from app.utils.sentry_sdk import init_sentry
 from app.version import get_version
 
 _CAPTURE_CLI_ANALYTICS = "capture_cli_analytics"
 _CLI_ANALYTICS_CAPTURED = "cli_analytics_captured"
+_CLI_ARGV = "cli_argv"
+
+
+def _option_value_count(command: click.Command, token: str) -> int:
+    for param in command.params:
+        if not isinstance(param, click.Option):
+            continue
+        if token not in (*param.opts, *param.secondary_opts):
+            continue
+        if param.is_flag or param.count:
+            return 0
+        return max(param.nargs, 1)
+    return 0
+
+
+def _resolve_command_parts(command: click.Command, argv: list[str]) -> list[str]:
+    """Resolve nested Click command names without recording option values."""
+    parts: list[str] = []
+    current = command
+    skip_values = 0
+
+    for token in argv:
+        if skip_values:
+            skip_values -= 1
+            continue
+        if token == "--":
+            break
+        if token.startswith("-") and token != "-":
+            if "=" not in token:
+                skip_values = _option_value_count(current, token)
+            continue
+        if not isinstance(current, click.Group):
+            continue
+
+        subcommand = current.get_command(click.Context(current), token)
+        if subcommand is None:
+            continue
+
+        parts.append(token)
+        current = subcommand
+
+    return parts
+
+
+def _cli_invoked_properties(ctx: click.Context) -> Properties:
+    raw_argv = ctx.obj.get(_CLI_ARGV, []) if ctx.obj else []
+    command_parts = _resolve_command_parts(
+        ctx.command,
+        raw_argv if isinstance(raw_argv, list) else [],
+    )
+    obj = ctx.obj if ctx.obj else {}
+    return build_cli_invoked_properties(
+        entrypoint="opensre",
+        command_parts=command_parts,
+        json_output=bool(obj.get("json", False)),
+        verbose=bool(obj.get("verbose", False)),
+        debug=bool(obj.get("debug", False)),
+        yes=bool(obj.get("yes", False)),
+        interactive=bool(obj.get("interactive", True)),
+    )
 
 
 def _capture_accepted_cli_invocation(ctx: click.Context) -> None:
@@ -38,7 +99,7 @@ def _capture_accepted_cli_invocation(ctx: click.Context) -> None:
         return
     ctx.obj[_CLI_ANALYTICS_CAPTURED] = True
     capture_first_run_if_needed()
-    capture_cli_invoked()
+    capture_cli_invoked(_cli_invoked_properties(ctx))
 
 
 @click.group(
@@ -81,6 +142,7 @@ def cli(
     ctx.obj["verbose"] = verbose
     ctx.obj["debug"] = debug
     ctx.obj["yes"] = yes
+    ctx.obj["interactive"] = interactive
 
     if verbose or debug:
         os.environ["TRACER_VERBOSE"] = "1"
@@ -123,12 +185,18 @@ def _install_sigint_handler() -> None:
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``opensre`` console script."""
     load_dotenv(override=False)
+    init_sentry()
     install_questionary_escape_cancel()
     install_questionary_ctrl_c_double_exit()
     _install_sigint_handler()
+    cli_argv = list(sys.argv[1:] if argv is None else argv)
 
     try:
-        cli(args=argv, standalone_mode=True, obj={_CAPTURE_CLI_ANALYTICS: True})
+        cli(
+            args=cli_argv,
+            standalone_mode=True,
+            obj={_CAPTURE_CLI_ANALYTICS: True, _CLI_ARGV: cli_argv},
+        )
     except KeyboardInterrupt:
         # A KeyboardInterrupt that escapes cli() was not handled by our
         # double-exit logic (e.g. click.prompt, an unpatched library prompt).
