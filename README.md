@@ -121,16 +121,34 @@ pipx install opensre
 
 ## Quick Start
 
+Configure once, then pick how you want to run investigations:
+
 ```bash
 opensre onboard
+```
+
+**Interactive prompt shell** — run `opensre` with no subcommand to enter the REPL (TTY required). Describe incidents in plain language, stream investigations, and use slash commands:
+
+```bash
+opensre
+```
+
+**Direct investigation** — run the agent once from your terminal against an alert file (no interactive shell):
+
+```bash
 opensre investigate -i tests/e2e/kubernetes/fixtures/datadog_k8s_alert.json
+```
+
+Other useful commands:
+
+```bash
 opensre update
 opensre uninstall   # remove opensre and all local data
 ```
 
 ### Interactive mode
 
-Running `opensre` with no arguments enters a persistent REPL session — an incident response terminal in the style of Claude Code. Describe an alert in plain text, watch the investigation stream live, then ask follow-up questions that stay grounded in what just ran.
+With no subcommand, `opensre` starts a persistent REPL session — an incident response terminal in the style of Claude Code. Describe an alert in plain text, watch the investigation stream live, then ask follow-up questions that stay grounded in what just ran.
 
 ```bash
 opensre
