@@ -16,7 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     from app.cli.investigation.payload import load_payload
     from app.utils.sentry_sdk import init_sentry
 
-    init_sentry()
+    init_sentry(entrypoint="cli")
     args = parse_args(argv)
     if args.print_template:
         write_json(build_alert_template(args.print_template), args.output)
