@@ -102,17 +102,6 @@ class TestTtyLiveRender:
         # Header still printed, but no thinking-spinner residue at finalize.
         assert "assistant:" in _strip_ansi(buf.getvalue())
 
-    def test_footer_prompt_kwarg_accepted_without_error(self) -> None:
-        """footer_prompt is accepted for backwards-compat but does not crash."""
-        console, buf = _tty_console()
-        result = stream_to_console(
-            console,
-            label="assistant",
-            chunks=_yield_chunks(["Hello"]),
-            footer_prompt="",
-        )
-        assert result == "Hello"
-
 
 class TestMidStreamError:
     """Errors inside the stream propagate while the partial buffer stays on screen."""

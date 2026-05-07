@@ -148,7 +148,7 @@ async def _run_one_turn(
         return should_continue
 
     if kind == "cli_help":
-        answer_cli_help(text, session, console, active_prompt=text)
+        answer_cli_help(text, session, console)
         session.record("cli_help", text)
         return True
 
@@ -172,7 +172,7 @@ async def _run_one_turn(
         )
         if turn.handled:
             return True
-        answer_cli_agent(text, session, console, active_prompt=text)
+        answer_cli_agent(text, session, console)
         session.record("cli_agent", text)
         return True
 
@@ -181,7 +181,7 @@ async def _run_one_turn(
         return True
 
     # follow_up — grounded answer against session.last_state
-    answer_follow_up(text, session, console, active_prompt=text)
+    answer_follow_up(text, session, console)
     session.record("follow_up", text)
     return True
 
@@ -210,7 +210,7 @@ async def _repl_main(initial_input: str | None = None, _config: ReplConfig | Non
                     return 0
                 console.print()
             elif kind == "cli_help":
-                answer_cli_help(stripped, session, console, active_prompt=stripped)
+                answer_cli_help(stripped, session, console)
                 session.record("cli_help", stripped)
             elif kind == "cli_agent":
                 turn = execute_cli_actions_with_metrics(stripped, session, console)
@@ -231,12 +231,12 @@ async def _repl_main(initial_input: str | None = None, _config: ReplConfig | Non
                     session_fallback_rate_percent=snapshot.fallback_rate_percent,
                 )
                 if not turn.handled:
-                    answer_cli_agent(stripped, session, console, active_prompt=stripped)
+                    answer_cli_agent(stripped, session, console)
                     session.record("cli_agent", stripped)
             elif kind == "new_alert":
                 _run_new_alert(stripped, session, console)
             else:
-                answer_follow_up(stripped, session, console, active_prompt=stripped)
+                answer_follow_up(stripped, session, console)
                 session.record("follow_up", stripped)
 
     while True:

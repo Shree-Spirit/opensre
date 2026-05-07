@@ -30,7 +30,6 @@ def stream_to_console(
     *,
     label: str,
     chunks: Iterator[str],
-    footer_prompt: str | None = None,  # noqa: ARG001 - reserved for upcoming footer-prompt wiring
     suppress_if_starts_with: str | None = None,
 ) -> str:
     """Render a streaming LLM response live and return the accumulated text.
@@ -38,9 +37,9 @@ def stream_to_console(
     Uses patch_stdout so prompt_toolkit keeps the input frame rendered at the
     bottom of the terminal while output streams above it.
 
-    ``footer_prompt`` is accepted (covered by a backwards-compat test) and will
-    be wired into the live render to keep the user prompt pinned below the
-    streaming output in a follow-up.
+    ``suppress_if_starts_with`` allows callers to skip live rendering when the
+    initial non-whitespace token indicates machine-readable payloads (for
+    example JSON action plans).
     """
     if not console.is_terminal:
         text = "".join(chunks)

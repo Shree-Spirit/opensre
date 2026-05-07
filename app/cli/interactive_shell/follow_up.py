@@ -74,14 +74,10 @@ def answer_follow_up(
     question: str,
     session: ReplSession,
     console: Console,
-    *,
-    active_prompt: str | None = None,  # noqa: ARG001 - reserved for upcoming footer-prompt wiring
 ) -> None:
     """Answer a follow-up question about the previous investigation.
 
-    ``active_prompt`` is accepted for API symmetry with the rest of the answer
-    surface and will feed the streaming footer in a follow-up; see
-    ``stream_to_console``.
+    The answer is grounded strictly in the prior investigation state.
     """
     if session.last_state is None:
         console.print(

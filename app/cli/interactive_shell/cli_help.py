@@ -78,8 +78,6 @@ def answer_cli_help(
     question: str,
     _session: ReplSession,
     console: Console,
-    *,
-    active_prompt: str | None = None,  # noqa: ARG001 - reserved for upcoming footer-prompt wiring
 ) -> None:
     """Run one turn of the documentation-aware procedural assistant.
 
@@ -90,9 +88,7 @@ def answer_cli_help(
     routing on a prior investigation.
 
     ``_session`` is accepted for API symmetry with :func:`answer_cli_agent` and
-    input routing; this path does not read session state today. ``active_prompt``
-    is accepted for the same reason and will feed the streaming footer once
-    that wiring lands; see ``stream_to_console``.
+    input routing; this path does not read session state today.
     """
     try:
         from app.services.llm_client import get_llm_for_reasoning
