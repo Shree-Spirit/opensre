@@ -5,14 +5,11 @@ on:
     branches: [main]
     paths-ignore:
       - "docs/**"
+      - "infra/**"
+      - "tests/**"
       - "**/*.md"
       - "**/*.mdx"
       - ".claude/**"
-      - "CLAUDE.md"
-      - "AGENTS.md"
-      - "SETUP.md"
-      - "README.md"
-      - "CONTRIBUTING.md"
       - ".understand-anything/**"
       - ".github/**"
   schedule:
