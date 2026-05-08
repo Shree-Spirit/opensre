@@ -38,7 +38,9 @@ _ACTION_RULE = (
     '`{"action":"switch_toolcall_model","model":"claude-opus-4-7"}` '
     "to change ONLY the toolcall model on the currently active provider; "
     '`{"action":"slash","command":"/model show"}` where command is one of '
-    "/model show, /list models, /health, /doctor, /version. For ordinary "
+    "/model show, /list models, /health, /doctor, /version; "
+    '`{"action":"run_cli_command","args":"<subcommand> <flags>"}` '
+    "to run any opensre subcommand (agent is blocked). For ordinary "
     "questions, return normal Markdown."
 )
 
@@ -188,6 +190,9 @@ def _execute_action_plan(
             )
         elif kind == "slash":
             label = str(action.get("command", "")).strip()
+        elif kind == "run_cli_command":
+            args = str(action.get("args", "")).strip()
+            label = f"opensre {args}" if args else "opensre"
         else:
             label = f"unsupported action: {kind or '?'}"
         console.print(f"[dim]{index}.[/dim] [{TERMINAL_ACCENT_BOLD}]{escape(label)}[/]")
@@ -258,7 +263,7 @@ def _execute_action_plan(
             stripped = command.strip()
             parts = stripped.split()
             name = parts[0].lower()
-            args = parts[1:]
+            arg_list = parts[1:]
             cmd_slash = SLASH_COMMANDS.get(name)
             if cmd_slash is None:
                 dispatch_slash(
@@ -269,7 +274,7 @@ def _execute_action_plan(
                     is_tty=is_tty,
                 )
                 continue
-            tier = resolve_slash_execution_tier(name, args, cmd_slash.execution_tier)
+            tier = resolve_slash_execution_tier(name, arg_list, cmd_slash.execution_tier)
             policy = evaluate_slash_tier(tier)
             if not execution_allowed(
                 policy,
@@ -291,6 +296,16 @@ def _execute_action_plan(
                 is_tty=is_tty,
                 policy_precleared=True,
             )
+            continue
+
+        if kind == "run_cli_command":
+            args = str(action.get("args", "")).strip()
+            if not args:
+                console.print("[red]missing args for run_cli_command action[/red]")
+                continue
+            from app.cli.interactive_shell.action_executor import run_opensre_cli_command
+
+            run_opensre_cli_command(args, session, console)
             continue
 
         console.print(f"[red]unsupported action:[/red] {escape(kind or '?')}")
