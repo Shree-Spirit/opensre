@@ -435,7 +435,7 @@ def _render_header() -> None:
       ─────────────────────────────────────────  [DIM rule]
         ___                    ____  ____  _____ [HIGHLIGHT art]
        / _ \\ ...
-      opensre  ·  v2026.4.7                      [SECONDARY name] [DIM ·] [BRAND version]
+      opensre  ·  v<version>                     [SECONDARY name] [DIM ·] [BRAND version]
       open-source SRE agent for automated …      [DIM description]
       ─────────────────────────────────────────  [DIM rule]
       Setup — Configure your local AI stack …    [SECONDARY subtitle]

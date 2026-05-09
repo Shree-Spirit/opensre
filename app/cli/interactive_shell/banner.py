@@ -176,7 +176,7 @@ def render_splash(console: Console | None = None, *, first_run: bool | None = No
     ╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋╋           [HIGHLIGHT art]
     ╋┏━━┓╋┏━━┓╋┏━━┓╋┏━┓╋╋┏━━┓╋┏━┓╋┏━━┓
     ...
-      opensre  [SECONDARY]  ·  v2026.4.7 [BRAND]
+      opensre  [SECONDARY]  ·  v<version> [BRAND]
       open-source SRE agent for automated incident
       investigation and root cause analysis          [DIM]
     ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ [DIM divider]
@@ -424,7 +424,7 @@ def render_ready_box(
     """Print the two-column welcome panel with an embedded title bar.
 
     Layout:
-    ── OpenSRE · v2026.4.5 ─────────────────────────────────────────────────╮
+    ── OpenSRE · v<version> ────────────────────────────────────────────────╮
     │                                                                         │
     │      Welcome back paul!          │  Tips for getting started            │
     │           █▀█                   │  Paste alert JSON or describe…        │

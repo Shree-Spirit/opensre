@@ -9,7 +9,7 @@ Rendered output (colour roles):
   ✓  env_file        .env (12 keys)
   ⚠  integrations    no integrations         [WARNING ⚠]
   ✗  llm_provider    ANTHROPIC_API_KEY unset [ERROR ✗]
-  ✓  version         2026.4.7 (up to date)
+  ✓  version         <version> (up to date)
   ✓  network         github.com reachable
 
 ──────────────────────────────────────────── [DIM rule]
