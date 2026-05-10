@@ -15,7 +15,7 @@ from tests.synthetic.rds_postgres.scenario_loader import (
 def _fake_final_state() -> dict[str, Any]:
     return {
         "root_cause": "Replication lag due to write pressure.",
-        "root_cause_category": "resource_exhaustion",
+        "root_cause_category": "replication_lag",
         "validated_claims": [],
         "non_validated_claims": [],
         "causal_chain": [],
@@ -36,7 +36,7 @@ def _fake_final_state() -> dict[str, Any]:
 def _fake_final_state_with_two_loops() -> dict[str, Any]:
     return {
         "root_cause": "Replication lag due to write pressure.",
-        "root_cause_category": "resource_exhaustion",
+        "root_cause_category": "replication_lag",
         "validated_claims": [],
         "non_validated_claims": [],
         "causal_chain": [],

@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, Protocol
 
-from app.cli.interactive_shell.action_planner import plan_cli_actions
+from app.cli.interactive_shell.action_planner import plan_actions_with_unhandled
+from app.cli.interactive_shell.intent_parser import (
+    _damerau_levenshtein_distance,
+    normalize_intent_text,
+)
 from app.cli.interactive_shell.terminal_intent import (
     is_sample_alert_launch_intent,
     mentions_alert_signal,
@@ -61,7 +65,17 @@ def _is_slash_prefix(text: str, _session: RoutingSession) -> bool:
 
 
 def _is_bare_command_alias(text: str, _session: RoutingSession) -> bool:
-    return text.strip().lower() in BARE_COMMAND_ALIASES
+    stripped = text.strip()
+    # Check exact (case-insensitive) match first so the typo corrector cannot
+    # mis-correct a valid command word (e.g. "reset" → "test").
+    if stripped.lower() in BARE_COMMAND_ALIASES:
+        return True
+    # Fall back to normalized form only for single-edit typos (distance ≤ 1).
+    # Distance 2 matches too many unrelated words (e.g. "hello" → "help").
+    normalized = normalize_intent_text(stripped)
+    if normalized not in BARE_COMMAND_ALIASES:
+        return False
+    return _damerau_levenshtein_distance(stripped.lower(), normalized) <= 1
 
 
 def _is_cli_help_rule(text: str, _session: RoutingSession) -> bool:
@@ -77,7 +91,15 @@ def _is_cli_agent_action_rule(
     _session: RoutingSession,
 ) -> bool:
     stripped = text.strip()
-    return bool(plan_cli_actions(stripped)) and not mentions_alert_signal(stripped)
+    actions, _unhandled = plan_actions_with_unhandled(stripped)
+    if not actions:
+        return False
+    # Synthetic-test and sample-alert commands may contain incident vocabulary
+    # in their scenario IDs (e.g. "002-connection-exhaustion"); allow them through
+    # even when mentions_alert_signal fires on those words.
+    if any(a.kind in {"synthetic_test", "sample_alert"} for a in actions):
+        return True
+    return not mentions_alert_signal(stripped)
 
 
 def _is_new_alert_without_prior_state(
@@ -435,3 +457,15 @@ def route_input(text: str, session: RoutingSession) -> RouteDecision:
 def classify_input(text: str, session: RoutingSession) -> InputKind:
     """Legacy InputKind adapter built on top of route_input()."""
     return route_input(text, session).route_kind.value
+
+
+def slash_dispatch_text(text: str) -> str:
+    """Return slash command text, including typo-tolerant bare alias mapping."""
+    stripped = text.strip()
+    if stripped.startswith("/"):
+        return stripped
+    normalized = normalize_intent_text(stripped)
+    mapped = BARE_COMMAND_ALIAS_MAP.get(normalized)
+    if mapped is not None:
+        return mapped
+    return f"/{stripped}"
