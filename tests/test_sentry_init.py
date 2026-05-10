@@ -638,7 +638,9 @@ def test_before_send_drops_operator_actionable_llm_errors(
 
 
 def test_before_send_keeps_non_llm_runtime_errors() -> None:
-    event = {"exception": {"values": [{"type": "RuntimeError", "value": "database invariant broke"}]}}
+    event = {
+        "exception": {"values": [{"type": "RuntimeError", "value": "database invariant broke"}]}
+    }
 
     assert sentry_mod._before_send(event, {}) == event
 
