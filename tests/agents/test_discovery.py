@@ -6,8 +6,121 @@ from pathlib import Path
 
 import pytest
 
+from app.agents import discovery
 from app.agents.discovery import ProcessRow, discover_agents, registered_and_discovered_agents
 from app.agents.registry import AgentRecord, AgentRegistry
+
+
+def test_discover_agent_processes_matches_known_agent_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(discovery.os, "getpid", lambda: 10)
+    monkeypatch.setattr(
+        discovery,
+        "_current_process_rows",
+        lambda: [
+            ProcessRow(pid=10, command="opensre"),
+            ProcessRow(pid=101, command="claude chat"),
+            ProcessRow(pid=102, command="claude code"),
+            ProcessRow(
+                pid=103,
+                command=(
+                    "/Users/example/.cursor/extensions/anthropic.claude-code/resources/claude "
+                    "--output-format stream-json --input-format stream-json"
+                ),
+            ),
+            ProcessRow(pid=104, command="aider"),
+            ProcessRow(pid=105, command="codex"),
+            ProcessRow(pid=202, command="python -m pytest"),
+        ],
+    )
+
+    candidates = discovery.discover_agent_processes()
+
+    assert [(item.name, item.pid) for item in candidates] == [
+        ("aider-104", 104),
+        ("claude-code-102", 102),
+        ("claude-code-103", 103),
+        ("codex-105", 105),
+    ]
+
+
+def test_discover_agent_processes_filters_desktop_helper_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(discovery.os, "getpid", lambda: 10)
+    monkeypatch.setattr(
+        discovery,
+        "_current_process_rows",
+        lambda: [
+            ProcessRow(pid=201, command="/Applications/Claude.app/Contents/MacOS/Claude"),
+            ProcessRow(
+                pid=202,
+                command=(
+                    "/Applications/Claude.app/Contents/Frameworks/Electron "
+                    "Framework.framework/Helpers/chrome_crashpad_handler "
+                    "--database=/Users/example/Library/Application Support/Claude/Crashpad"
+                ),
+            ),
+            ProcessRow(
+                pid=203,
+                command=(
+                    "/Applications/Claude.app/Contents/Frameworks/Claude Helper "
+                    "(Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer"
+                ),
+            ),
+            ProcessRow(
+                pid=204,
+                command=(
+                    "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper "
+                    "(Plugin).app/Contents/MacOS/Cursor Helper (Plugin) "
+                    "/Applications/Cursor.app/Contents/Resources/app/extensions/"
+                    "json-language-features/server/dist/node/jsonServerMain"
+                ),
+            ),
+            ProcessRow(
+                pid=205,
+                command=(
+                    "/Applications/Cursor.app/Contents/Frameworks/Squirrel.framework/Resources/"
+                    "ShipIt com.todesktop.230313mzl4w4u92.ShipIt"
+                ),
+            ),
+        ],
+    )
+
+    assert discovery.discover_agent_processes() == []
+
+
+def test_discover_agent_processes_all_mode_includes_filtered_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(discovery.os, "getpid", lambda: 10)
+    monkeypatch.setattr(
+        discovery,
+        "_current_process_rows",
+        lambda: [
+            ProcessRow(
+                pid=202,
+                command=(
+                    "/Applications/Claude.app/Contents/Frameworks/Electron "
+                    "Framework.framework/Helpers/chrome_crashpad_handler"
+                ),
+            ),
+        ],
+    )
+
+    candidates = discovery.discover_agent_processes(include_all=True)
+
+    assert [(item.name, item.pid) for item in candidates] == [("claude-code-202", 202)]
+
+
+def test_display_command_truncates_long_commands() -> None:
+    command = "claude " + ("--very-long-option " * 20)
+
+    display = discovery.display_command(command)
+
+    assert len(display) == 120
+    assert display.endswith("...")
 
 
 def test_discovers_cursor_claude_code_process() -> None:
