@@ -87,16 +87,6 @@ _RETRY_MAX_ATTEMPTS = 3
 # silent network drops.
 _CLIENT_TIMEOUT_SEC = 60.0
 
-# Bedrock boto3 error codes that must not be retried (invalid config, no access).
-_BEDROCK_NON_RETRYABLE_CODES = frozenset(
-    {
-        "ValidationException",
-        "AccessDeniedException",
-        "ResourceNotFoundException",
-        "UnauthorizedException",
-    }
-)
-
 
 @dataclass(frozen=True)
 class RootCauseResult:
@@ -347,18 +337,34 @@ class BedrockLLMClient:
                 response = self._anthropic_client.messages.create(**kwargs)
                 break
             except AnthropicBadRequestError as err:
+                err_msg = str(err)
+                if "on-demand throughput" in err_msg or "inference profile" in err_msg.lower():
+                    raise RuntimeError(
+                        f"Bedrock model '{self._model}' requires a cross-region inference profile. "
+                        f"Try prefixing with 'us.' (e.g. 'us.{self._model}') and update "
+                        "BEDROCK_REASONING_MODEL or BEDROCK_TOOLCALL_MODEL."
+                    ) from err
                 raise RuntimeError(
-                    f"Bedrock Anthropic request rejected (HTTP 400): {err.message}"
+                    f"Bedrock Anthropic request rejected (HTTP 400) for model "
+                    f"'{self._model}': {err.message}"
                 ) from err
             except GuardrailBlockedError:
                 raise
-            except (
-                AuthenticationError,
-                PermissionDeniedError,
-                NotFoundError,
-            ) as err:
+            except AuthenticationError as err:
                 raise RuntimeError(
-                    f"Bedrock API request failed: {type(err).__name__}: {err}"
+                    f"Bedrock authentication failed for model '{self._model}'. "
+                    "Check AWS credentials, region configuration, and Bedrock access."
+                ) from err
+            except NotFoundError as err:
+                raise RuntimeError(
+                    f"Bedrock model '{self._model}' was not found or has reached end-of-life. "
+                    "Update BEDROCK_REASONING_MODEL or BEDROCK_TOOLCALL_MODEL to a supported model."
+                ) from err
+            except PermissionDeniedError as err:
+                raise RuntimeError(
+                    f"Bedrock model '{self._model}' is not available for your account. "
+                    "Check your AWS Marketplace subscription and account permissions, "
+                    "or update BEDROCK_REASONING_MODEL / BEDROCK_TOOLCALL_MODEL."
                 ) from err
             except Exception as err:
                 last_err = err
@@ -412,13 +418,31 @@ class BedrockLLMClient:
                 break
             except GuardrailBlockedError:
                 raise
+            except botocore.exceptions.ClientError as err:
+                code = err.response.get("Error", {}).get("Code", "")
+                if code == "ValidationException":
+                    raise RuntimeError(
+                        f"Bedrock model ID '{self._model}' is invalid. "
+                        "Check BEDROCK_REASONING_MODEL or BEDROCK_TOOLCALL_MODEL."
+                    ) from err
+                if code == "ResourceNotFoundException":
+                    raise RuntimeError(
+                        f"Bedrock model '{self._model}' was not found in the configured region. "
+                        "Check the model ID, region, or inference profile."
+                    ) from err
+                if code in ("AccessDeniedException", "UnauthorizedException"):
+                    raise RuntimeError(
+                        f"Access denied for Bedrock model '{self._model}'. "
+                        "Check your AWS IAM permissions and account configuration."
+                    ) from err
+                last_err = err
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        f"Bedrock API request failed after {max_attempts} attempts: {type(err).__name__}: {err}"
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
             except Exception as err:
-                if isinstance(err, botocore.exceptions.ClientError):
-                    code = err.response.get("Error", {}).get("Code", "")
-                    if code in _BEDROCK_NON_RETRYABLE_CODES:
-                        raise RuntimeError(
-                            f"Bedrock API request failed: {type(err).__name__}: {err}"
-                        ) from err
                 last_err = err
                 if attempt == max_attempts - 1:
                     raise RuntimeError(
