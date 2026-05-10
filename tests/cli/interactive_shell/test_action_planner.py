@@ -24,3 +24,16 @@ def test_plan_actions_with_unhandled_all_handled() -> None:
 def test_plan_terminal_tasks_returns_kinds() -> None:
     msg = "check opensre health and show connected services"
     assert plan_terminal_tasks(msg) == ["slash", "slash"]
+
+
+def test_plan_cli_actions_remote_deployment_inventory_questions() -> None:
+    messages = (
+        "Which remote deployments are connected?",
+        "Which remote's deployments are connected?",
+        "What remote deployments are connected?",
+        "show remote deployments",
+        "list remote deployments",
+    )
+
+    for message in messages:
+        assert plan_cli_actions(message) == ["/remote"]

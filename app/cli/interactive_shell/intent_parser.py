@@ -54,7 +54,8 @@ ACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"\b(?:check|trigger|run|show)\b.{0,80}?\b(?:remote|deployed)\b",
+            r"\b(?:check|trigger|run|show|list|get|which|what)\b.{0,80}?"
+            r"\b(?:remote(?:'s)?|deployed|deployments?)\b",
             re.IGNORECASE,
         ),
         "/remote",
