@@ -197,6 +197,8 @@ def test_track_investigation_emits_failed_on_exception(
     monkeypatch.setattr(cli, "get_analytics", lambda: stub)
 
     with pytest.raises(RuntimeError, match="boom"):  # noqa: SIM117
+        # Keep nested (not combined) so CodeQL can prove control flow past the
+        # raise via pytest.raises is reachable (see PR #1846 review threads).
         with cli.track_investigation(
             entrypoint=EntrypointSource.MCP,
             trigger_mode=TriggerMode.SERVICE_RUNTIME,
