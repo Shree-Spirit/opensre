@@ -1,54 +1,30 @@
-from __future__ import annotations
-
-import sys
-
-from fastapi import FastAPI, Response, status
-from pydantic import BaseModel, ValidationError
-
-from app.config import LLMSettings, get_environment
-from app.version import get_version
-
-
-class HealthResponse(BaseModel):
-    ok: bool
-    version: str
-    graph_loaded: bool
-    llm_configured: bool
-    env: str
-
+from pydantic import BaseModel
+from fastapi import FastAPI
+from app.telegram_bot import send_message
 
 app = FastAPI()
 
 
-def _graph_loaded() -> bool:
-    return "app.graph_pipeline" in sys.modules
+class Alert(BaseModel):
+    service: str
+    severity: str
+    message: str
 
 
-def _llm_configured() -> bool:
-    try:
-        LLMSettings.from_env()
-    except ValidationError:
-        return False
-    return True
+@app.post("/alert")
+def send_alert(alert: Alert):
+    text = f"""
+🚨 OpenSRE ALERT 🚨
+
+Service: {alert.service}
+Severity: {alert.severity}
+Message: {alert.message}
+"""
+    send_message(text)
+    return {"status": "alert sent"}
 
 
-def get_health_response() -> HealthResponse:
-    graph_loaded = _graph_loaded()
-    llm_configured = _llm_configured()
-
-    return HealthResponse(
-        ok=graph_loaded and llm_configured,
-        version=get_version(),
-        graph_loaded=graph_loaded,
-        llm_configured=llm_configured,
-        env=get_environment().value,
-    )
-
-
-@app.get("/health", response_model=HealthResponse)
-def health(response: Response) -> HealthResponse:
-    health_response = get_health_response()
-    response.status_code = (
-        status.HTTP_200_OK if health_response.ok else status.HTTP_503_SERVICE_UNAVAILABLE
-    )
-    return health_response
+@app.get("/test-telegram")
+def test():
+    send_message("🔥 Alert from OpenSRE!")
+    return {"status": "sent"}
