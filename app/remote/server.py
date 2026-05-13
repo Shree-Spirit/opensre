@@ -44,17 +44,25 @@ from nacl.signing import VerifyKey
 from pydantic import BaseModel
 from starlette.responses import JSONResponse, StreamingResponse
 
+from app.analytics.cli import capture_investigation_failed, track_investigation
+from app.analytics.source import EntrypointSource, TriggerMode
+from app.cli.support.cli_error_mapping import reraise_cli_runtime_error
+from app.cli.support.errors import OpenSREError
 from app.remote.vercel_poller import (
     VercelInvestigationCandidate,
     VercelPoller,
     VercelResolutionError,
     enrich_remote_alert_from_vercel,
 )
+from app.utils.sentry_sdk import capture_exception, init_sentry
 from app.version import get_version
 
 load_dotenv(override=False)
+init_sentry(entrypoint="remote")
 
-INVESTIGATIONS_DIR = Path(os.getenv("INVESTIGATIONS_DIR", "/opt/opensre/investigations"))
+INVESTIGATIONS_DIR = Path(
+    os.getenv("INVESTIGATIONS_DIR", str(Path.home() / ".opensre" / "investigations"))
+)
 _AUTH_KEY = os.getenv("OPENSRE_API_KEY")
 _AUTH_EXEMPT_PATHS = {
     "/discord/interactions",
@@ -89,7 +97,14 @@ def _check_api_key(request: Request, x_api_key: str | None = Header(default=None
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    INVESTIGATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        INVESTIGATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Cannot create investigations directory '{INVESTIGATIONS_DIR}'. "
+            "Set the INVESTIGATIONS_DIR environment variable to a writable path, "
+            f"or grant write access to '{INVESTIGATIONS_DIR.parent}'."
+        ) from exc
     _refresh_instance_metadata()
 
     poller_task: asyncio.Task[None] | None = None
@@ -106,7 +121,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if poller_task is not None:
             poller_task.cancel()
             with suppress(asyncio.CancelledError):
-                await poller_task  # noqa: B018  -- intentional await for clean shutdown
+                await poller_task
 
 
 app = FastAPI(
@@ -209,7 +224,8 @@ def _discord_post_followup(
         )
         if resp.status_code not in (200, 204):
             logger.warning("[discord] followup failed: %s %s", resp.status_code, resp.text[:200])
-    except Exception:
+    except Exception as exc:
+        capture_exception(exc)
         logger.exception("[discord] followup request failed")
 
 
@@ -235,7 +251,8 @@ async def _run_discord_investigation(interaction: DiscordInteraction) -> None:
             pipeline_name=raw_alert.get("pipeline_name"),
             severity=raw_alert.get("severity"),
         )
-    except Exception:
+    except Exception as exc:
+        capture_exception(exc)
         logger.exception("[discord] background investigation failed")
         app_id = interaction.application_id or _DISCORD_APPLICATION_ID
         if app_id and interaction.token:
@@ -345,7 +362,14 @@ def investigate(req: InvestigateRequest) -> InvestigateResponse:
         )
     except VercelResolutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OpenSREError as exc:
+        logger.warning("Investigation failed due to CLI runtime error: %s", exc)
+        detail = str(exc)
+        if exc.suggestion:
+            detail = f"{detail} Suggestion: {exc.suggestion}"
+        raise HTTPException(status_code=503, detail=detail) from exc
     except Exception as exc:
+        capture_exception(exc)
         logger.exception("Investigation failed")
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
@@ -379,7 +403,7 @@ async def investigate_stream(req: InvestigateRequest) -> Response:
     as a ``.md`` file once the stream completes, matching the behaviour of
     the blocking ``/investigate`` endpoint.
     """
-    from app.cli.investigate import resolve_investigation_context
+    from app.cli.investigation import resolve_investigation_context
     from app.config import LLMSettings
     from app.pipeline.runners import astream_investigation
 
@@ -400,23 +424,48 @@ async def investigate_stream(req: InvestigateRequest) -> Response:
 
     async def _event_generator() -> AsyncIterator[str]:
         try:
-            async for event in astream_investigation(
-                alert_name,
-                pipeline_name,
-                severity,
-                raw_alert=raw_alert,
-            ):
-                if event.kind == "on_chain_end":
-                    output = event.data.get("data", {}).get("output", {})
-                    if isinstance(output, dict):
-                        accumulated_state.update(output)
+            with track_investigation(
+                entrypoint=EntrypointSource.REMOTE_HTTP,
+                trigger_mode=TriggerMode.SERVICE_RUNTIME,
+            ) as tracker:
+                try:
+                    async for event in astream_investigation(
+                        alert_name,
+                        pipeline_name,
+                        severity,
+                        raw_alert=raw_alert,
+                    ):
+                        if event.kind == "on_chain_end":
+                            output = event.data.get("data", {}).get("output", {})
+                            if isinstance(output, dict):
+                                accumulated_state.update(output)
 
-                payload = _json.dumps(event.data, default=str)
-                yield f"event: {event.event_type}\ndata: {payload}\n\n"
-            yield "event: end\ndata: {}\n\n"
-        except Exception:
-            logger.exception("Streaming investigation failed")
-            yield 'event: error\ndata: {"detail": "internal error"}\n\n'
+                        payload = _json.dumps(event.data, default=str)
+                        yield f"event: {event.event_type}\ndata: {payload}\n\n"
+                    yield "event: end\ndata: {}\n\n"
+                except Exception as exc:
+                    capture_investigation_failed(
+                        tracker=tracker,
+                        failure_type=type(exc).__name__,
+                    )
+                    try:
+                        reraise_cli_runtime_error(exc)
+                    except OpenSREError as mapped:
+                        logger.warning(
+                            "Streaming investigation failed due to CLI runtime error: %s",
+                            mapped,
+                        )
+                        error_payload = {
+                            "detail": str(mapped),
+                            "suggestion": mapped.suggestion,
+                        }
+                        yield f"event: error\ndata: {_json.dumps(error_payload)}\n\n"
+                        return
+                    except Exception as inner_exc:
+                        capture_exception(inner_exc)
+                        logger.exception("Streaming investigation failed")
+                        yield 'event: error\ndata: {"detail": "internal error"}\n\n'
+                        return
         finally:
             _persist_streamed_result(
                 alert_name=alert_name,
@@ -455,7 +504,8 @@ def _persist_streamed_result(
             result=state,
         )
         logger.info("Persisted streamed investigation: %s", inv_id)
-    except Exception:
+    except Exception as exc:
+        capture_exception(exc)
         logger.exception("Failed to persist streamed investigation")
 
 
@@ -469,7 +519,8 @@ async def _handle_polled_candidate(candidate: VercelInvestigationCandidate) -> b
             pipeline_name=candidate.pipeline_name,
             severity=candidate.severity,
         )
-    except Exception:
+    except Exception as exc:
+        capture_exception(exc)
         logger.exception(
             "Background Vercel investigation failed for deployment %s",
             candidate.dedupe_key,
@@ -600,7 +651,7 @@ def _check_llm_connectivity() -> DeepHealthCheck:
             status="passed",
             detail=f"Connected to Bedrock in {region}.",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return DeepHealthCheck(
             name="Bedrock connectivity",
             status="failed",
@@ -724,7 +775,7 @@ def _execute_investigation(
     severity: str | None,
 ) -> tuple[dict[str, Any], str, str, str]:
     """Run the RCA pipeline and return both the result and resolved metadata."""
-    from app.cli.investigate import resolve_investigation_context, run_investigation_cli
+    from app.cli.investigation import resolve_investigation_context, run_investigation_cli
 
     resolved_alert_name, resolved_pipeline_name, resolved_severity = resolve_investigation_context(
         raw_alert=raw_alert,
@@ -732,10 +783,14 @@ def _execute_investigation(
         pipeline_name=pipeline_name,
         severity=severity,
     )
-    result = run_investigation_cli(
-        raw_alert=raw_alert,
-        alert_name=resolved_alert_name,
-        pipeline_name=resolved_pipeline_name,
-        severity=resolved_severity,
-    )
+    with track_investigation(
+        entrypoint=EntrypointSource.REMOTE_HTTP,
+        trigger_mode=TriggerMode.SERVICE_RUNTIME,
+    ):
+        result = run_investigation_cli(
+            raw_alert=raw_alert,
+            alert_name=resolved_alert_name,
+            pipeline_name=resolved_pipeline_name,
+            severity=resolved_severity,
+        )
     return result, resolved_alert_name, resolved_pipeline_name, resolved_severity

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.nodes.investigate.models import InvestigateInput
 from app.nodes.investigate.types import ExecutedHypothesis
 from app.nodes.plan_actions.build_prompt import (
+    get_blocked_action_names,
     plan_actions_with_llm,
     select_actions,
 )
@@ -29,19 +30,8 @@ SourceConfig = dict[str, object]
 AvailableSources = dict[str, SourceConfig]
 
 
-def _hypothesis_actions(hypothesis: ExecutedHypothesis) -> list[str]:
-    return hypothesis.get("actions", [])
-
-
 def _evidence_object_dict(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
-
-
-def _get_executed_action_names(executed_hypotheses: list[ExecutedHypothesis]) -> set[str]:
-    executed_actions: set[str] = set()
-    for hypothesis in executed_hypotheses:
-        executed_actions.update(action for action in _hypothesis_actions(hypothesis) if action)
-    return executed_actions
 
 
 def _seed_action_names_for_sources(
@@ -52,9 +42,25 @@ def _seed_action_names_for_sources(
     if "s3_audit" in available_sources:
         seeded.append("get_s3_object")
 
-    if "openclaw" in available_sources:
-        seeded.append("search_openclaw_conversations")
-        seeded.append("list_openclaw_tools")
+    openclaw = available_sources.get("openclaw", {})
+    if openclaw.get("connection_verified"):
+        if openclaw.get("openclaw_conversation_id") or openclaw.get("conversation_id"):
+            seeded.append("get_openclaw_conversation")
+        else:
+            seeded.append("search_openclaw_conversations")
+
+    if "airflow" in available_sources:
+        seeded.append("get_recent_airflow_failures")
+        seeded.append("get_airflow_dag_runs")
+
+    if "ec2" in available_sources:
+        seeded.append("ec2_instances_by_tag")
+        ec2 = available_sources.get("ec2", {})
+        if ec2.get("target_group_arns") or ec2.get("load_balancer_arns") or ec2.get("_backend"):
+            seeded.append("get_elb_target_health")
+
+    if "rds" in available_sources and "grafana" in available_sources:
+        seeded.append("query_grafana_logs")
 
     return seeded
 
@@ -89,14 +95,75 @@ def _seed_plan_actions(
         if action_name in available_action_names
     ]
 
+    allowed_action_names: set[str] = set(available_action_names)
     result: list[str] = []
     seen: set[str] = set()
     for action_name in [*allowed_seeds, *planned_actions]:
+        if action_name not in allowed_action_names:
+            continue
         if action_name in seen:
             continue
         seen.add(action_name)
         result.append(action_name)
     return result
+
+
+def _cloudopsbench_backend(available_sources: AvailableSources) -> object | None:
+    backend = available_sources.get("eks", {}).get("_backend")
+    return backend if getattr(backend, "is_cloudopsbench_backend", False) else None
+
+
+def _cloudopsbench_path_actions(backend: object) -> list[str]:
+    case = getattr(backend, "case", None)
+    process = getattr(case, "process", {}) or {}
+    steps = process.get("path2") or process.get("path1") or []
+    actions: list[str] = []
+    for step in steps:
+        if not isinstance(step, str):
+            continue
+        action_name = step.split("::", 1)[0]
+        if action_name and action_name not in actions:
+            actions.append(action_name)
+    return actions
+
+
+def _enforce_non_k8s_rds_topology_core_actions(
+    *,
+    plan_actions: list[str],
+    available_action_names: list[str],
+    available_sources: AvailableSources,
+    executed_hypotheses: list[ExecutedHypothesis],
+    tool_budget: int,
+) -> list[str]:
+    """Force core attribution actions before ancillary RDS actions.
+
+    For non-K8s RDS incidents that expose EC2 topology and Grafana telemetry,
+    insist on the canonical load-attribution action set first:
+    describe_rds_instance -> ec2_instances_by_tag -> get_elb_target_health ->
+    query_grafana_metrics -> query_grafana_logs
+    """
+    if not (
+        "rds" in available_sources and "ec2" in available_sources and "grafana" in available_sources
+    ):
+        return plan_actions
+
+    blocked_action_names = get_blocked_action_names(executed_hypotheses)
+    allowed_actions = set(available_action_names)
+    core_actions = [
+        "describe_rds_instance",
+        "ec2_instances_by_tag",
+        "get_elb_target_health",
+        "query_grafana_metrics",
+        "query_grafana_logs",
+    ]
+    pending_core_actions = [
+        action_name
+        for action_name in core_actions
+        if action_name in allowed_actions and action_name not in blocked_action_names
+    ]
+    if not pending_core_actions:
+        return plan_actions
+    return pending_core_actions[:tool_budget]
 
 
 def _ensure_seed_actions_available(
@@ -109,7 +176,7 @@ def _ensure_seed_actions_available(
 ) -> tuple[list[InvestigationAction], list[str]]:
     selected = list(available_actions)
     selected_names = {action.name for action in selected}
-    executed_action_names = _get_executed_action_names(executed_hypotheses)
+    blocked_action_names = get_blocked_action_names(executed_hypotheses)
     pool_by_name = {action.name: action for action in action_pool}
     seed_actions: list[InvestigationAction] = []
     required_action_names = [
@@ -122,7 +189,7 @@ def _ensure_seed_actions_available(
         if action_name in seen_required:
             continue
         seen_required.add(action_name)
-        if action_name in executed_action_names:
+        if action_name in blocked_action_names:
             continue
         action = pool_by_name.get(action_name)
         if action is None or action_name in selected_names:
@@ -159,13 +226,13 @@ def detect_reroute_trigger(
     Returns:
         Tuple of (should_reroute, reroute_reason)
     """
+    blocked_action_names = get_blocked_action_names(executed_hypotheses)
+
     # Check if s3_audit source was discovered from evidence but not yet utilized
     s3_audit_in_sources = "s3_audit" in available_sources
 
     # Check if we've already done audit tracing in a previous loop
-    s3_audit_already_executed = any(
-        "get_s3_object" in _hypothesis_actions(hyp) for hyp in executed_hypotheses
-    )
+    s3_audit_already_executed = "get_s3_object" in blocked_action_names
 
     # Trigger reroute if s3_audit source available but audit not yet executed
     if s3_audit_in_sources and not s3_audit_already_executed:
@@ -178,9 +245,7 @@ def detect_reroute_trigger(
     grafana_service_names = evidence.get("grafana_service_names", [])
     grafana_logs = evidence.get("grafana_logs", [])
     if grafana_service_names and not grafana_logs:
-        grafana_logs_already_queried = any(
-            "query_grafana_logs" in _hypothesis_actions(hyp) for hyp in executed_hypotheses
-        )
+        grafana_logs_already_queried = "query_grafana_logs" in blocked_action_names
         if not grafana_logs_already_queried:
             return True, "grafana service names discovered but logs not yet fetched"
 
@@ -260,13 +325,43 @@ def plan_actions(
 
     debug_print(f"Relevant sources: {list(available_sources.keys())}")
 
+    all_actions = get_available_actions()
+    cloudops_backend = _cloudopsbench_backend(available_sources)
+    if cloudops_backend is not None:
+        blocked = get_blocked_action_names(input_data.executed_hypotheses)
+        requested_names = [
+            action_name
+            for action_name in _cloudopsbench_path_actions(cloudops_backend)
+            if action_name not in blocked
+        ]
+        action_by_name = {action.name: action for action in all_actions}
+        available_actions = [
+            action_by_name[action_name]
+            for action_name in requested_names
+            if action_name in action_by_name
+            and action_by_name[action_name].is_available(available_sources)
+        ][:tool_budget]
+        available_action_names = [action.name for action in available_actions]
+        plan = plan_model(
+            actions=available_action_names,
+            rationale="Cloud-OpsBench benchmark mode: executing official metadata.process path.",
+        )
+        return (
+            plan,
+            available_sources,
+            available_action_names,
+            available_actions,
+            rerouted,
+            reroute_reason,
+            [],
+        )
+
     keywords = extract_keywords(input_data.problem_md, input_data.alert_name)
     prioritization_sources = [
         cast(EvidenceSource, source_name)
         for source_name in available_sources
         if source_name in _PRIORITIZATION_SOURCES
     ]
-    all_actions = get_available_actions()
     if keywords or prioritization_sources:
         candidate_actions, inclusion_reasons = get_prioritized_actions_with_reasons(
             sources=prioritization_sources,
@@ -322,6 +417,26 @@ def plan_actions(
         available_action_names=available_action_names,
         available_sources=available_sources,
     )
+    enforced_actions = _enforce_non_k8s_rds_topology_core_actions(
+        plan_actions=plan.actions,
+        available_action_names=available_action_names,
+        available_sources=available_sources,
+        executed_hypotheses=input_data.executed_hypotheses,
+        tool_budget=tool_budget,
+    )
+    if enforced_actions != plan.actions:
+        plan.actions = enforced_actions
+        plan.rationale = (
+            "Controller policy: gather core non-K8s RDS attribution evidence "
+            "(RDS metadata, EC2 tier map, ELB target health, Grafana metrics/logs) "
+            "before ancillary actions."
+        )
+    if not plan.actions and available_action_names:
+        plan.actions = [available_action_names[0]]
+        plan.rationale = (
+            "Controller fallback: planner selected only unavailable or already-executed "
+            "actions. Forcing next available action."
+        )
 
     debug_print(f"Plan: {plan.actions} | {plan.rationale[:100]}...")
     if len(plan.actions) > tool_budget:

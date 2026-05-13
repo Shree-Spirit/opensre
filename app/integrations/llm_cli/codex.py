@@ -1,13 +1,17 @@
-"""OpenAI Codex CLI adapter (`codex exec`, non-interactive)."""
+"""OpenAI Codex CLI adapter (`codex exec`, non-interactive).
+
+OpenAI Platform env vars (``OPENAI_API_KEY``, ``OPENAI_ORG_ID``, ``OPENAI_PROJECT_ID``,
+``OPENAI_BASE_URL``) are forwarded on invoke when set, so Codex runs work with
+usage-based API key auth as well as ``codex login`` sessions.
+"""
 
 from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 
-from app.integrations.llm_cli.base import CLIInvocation, CLIProbe, PromptDelivery
+from app.integrations.llm_cli.base import CLIInvocation, CLIProbe
 from app.integrations.llm_cli.binary_resolver import (
     candidate_binary_names as _candidate_binary_names,
 )
@@ -15,10 +19,11 @@ from app.integrations.llm_cli.binary_resolver import (
     default_cli_fallback_paths as _default_cli_fallback_paths,
 )
 from app.integrations.llm_cli.binary_resolver import (
-    is_runnable_binary as _is_runnable_binary,
-)
-from app.integrations.llm_cli.binary_resolver import (
     resolve_cli_binary,
+)
+from app.integrations.llm_cli.env_overrides import (
+    OPENAI_PLATFORM_ENV_KEYS,
+    nonempty_env_values,
 )
 
 _CODEX_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
@@ -27,7 +32,8 @@ _READ_ONLY_SANDBOX = "read-only"
 
 
 def _ver_tuple(version: str) -> tuple[int, int, int]:
-    parts = [int(p) for p in version.split(".") if p.isdigit()]
+    # Extract all leading digit runs so "1.2.3-beta.4" → (1, 2, 3), "1.2a.3" → (1, 2, 3).
+    parts = [int(m) for m in re.findall(r"\d+", version)][:3]
     while len(parts) < 3:
         parts.append(0)
     return parts[0], parts[1], parts[2]
@@ -84,6 +90,10 @@ def _fallback_codex_paths() -> list[str]:
     return _default_cli_fallback_paths("codex")
 
 
+def _has_openai_api_key() -> bool:
+    return bool(os.environ.get("OPENAI_API_KEY", "").strip())
+
+
 class CodexAdapter:
     """Non-interactive Codex CLI (`codex exec` with read-only sandbox)."""
 
@@ -93,15 +103,12 @@ class CodexAdapter:
     auth_hint = "Run: codex login"
     min_version: str | None = None
     default_exec_timeout_sec = 120.0
-    prompt_delivery: PromptDelivery = "stdin"
 
     def _resolve_binary(self) -> str | None:
         return resolve_cli_binary(
             explicit_env_key="CODEX_BIN",
             binary_names=_candidate_binary_names("codex"),
             fallback_paths=_fallback_codex_paths,
-            which_resolver=shutil.which,
-            runnable_check=_is_runnable_binary,
         )
 
     def _probe_binary(self, binary_path: str) -> CLIProbe:
@@ -156,6 +163,11 @@ class CodexAdapter:
                 auth_proc.returncode, auth_proc.stdout, auth_proc.stderr
             )
 
+        if logged_in is not True and _has_openai_api_key():
+            # Allow API-key auth when ChatGPT/session login is absent or unclear.
+            logged_in = True
+            auth_detail = "Authenticated via OPENAI_API_KEY fallback."
+
         detail = auth_detail + upgrade_note
         return CLIProbe(
             installed=True,
@@ -177,7 +189,14 @@ class CodexAdapter:
             )
         return self._probe_binary(binary)
 
-    def build(self, *, prompt: str, model: str | None, workspace: str) -> CLIInvocation:
+    def build(
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        workspace: str,
+        reasoning_effort: str | None = None,
+    ) -> CLIInvocation:
         binary = self._resolve_binary()
         if not binary:
             raise RuntimeError(
@@ -205,14 +224,17 @@ class CodexAdapter:
         resolved_model = (model or "").strip()
         if resolved_model:
             argv.extend(["-m", resolved_model])
+        if reasoning_effort:
+            argv.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
         argv.append("-")
 
+        oai = nonempty_env_values(OPENAI_PLATFORM_ENV_KEYS)
         return CLIInvocation(
             argv=tuple(argv),
             stdin=prompt,
             cwd=ws,
-            env=None,
+            env=oai or None,
             timeout_sec=self.default_exec_timeout_sec,
         )
 

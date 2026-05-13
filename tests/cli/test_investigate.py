@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-import pytest
-from pydantic import ValidationError
+from typing import NoReturn
 
-from app.cli.investigate import (
+import pytest
+
+from app.cli.investigation import (
     resolve_investigation_context,
     run_investigation_cli,
     stream_investigation_cli,
 )
+from app.cli.support.cli_error_mapping import reraise_cli_runtime_error
+from app.cli.support.errors import OpenSREError
+from app.integrations.llm_cli.errors import CLIAuthenticationRequired
 from app.remote.stream import StreamEvent
 
 
@@ -49,8 +53,10 @@ def test_run_investigation_cli_shapes_agent_state(monkeypatch) -> None:
             "root_cause": "bad deploy",
         }
 
-    monkeypatch.setattr("app.cli.investigate.LLMSettings.from_env", object)
-    monkeypatch.setattr("app.cli.investigate._call_run_investigation", fake_run_investigation)
+    monkeypatch.setattr("app.cli.investigation.investigate.LLMSettings.from_env", object)
+    monkeypatch.setattr(
+        "app.cli.investigation.investigate._call_run_investigation", fake_run_investigation
+    )
 
     result = run_investigation_cli(
         raw_alert={"alert_name": "PayloadAlert"},
@@ -91,8 +97,8 @@ def test_run_investigation_cli_evaluate_reports_skip_when_no_rubric(monkeypatch)
             "opensre_llm_eval": {},
         }
 
-    monkeypatch.setattr("app.cli.investigate.LLMSettings.from_env", object)
-    monkeypatch.setattr("app.cli.investigate._call_run_investigation", fake_run)
+    monkeypatch.setattr("app.cli.investigation.investigate.LLMSettings.from_env", object)
+    monkeypatch.setattr("app.cli.investigation.investigate._call_run_investigation", fake_run)
 
     result = run_investigation_cli(
         raw_alert={"alert_name": "A"},
@@ -103,7 +109,7 @@ def test_run_investigation_cli_evaluate_reports_skip_when_no_rubric(monkeypatch)
 
 
 def test_parse_args_evaluate_flag() -> None:
-    from app.cli.args import parse_args
+    from app.cli.support.args import parse_args
 
     assert parse_args(["--input", "a.json"]).evaluate is False
     assert parse_args(["--input", "a.json", "--evaluate"]).evaluate is True
@@ -113,11 +119,11 @@ def test_run_investigation_cli_fails_fast_for_invalid_llm_config(monkeypatch) ->
     monkeypatch.setenv("LLM_PROVIDER", "openai")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(
-        "app.cli.investigate._call_run_investigation",
+        "app.cli.investigation.investigate._call_run_investigation",
         lambda *_args, **_kwargs: pytest.fail("investigation should not start"),
     )
 
-    with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+    with pytest.raises(OpenSREError, match="OPENAI_API_KEY"):
         run_investigation_cli(raw_alert={"alert_name": "PayloadAlert"})
 
 
@@ -128,7 +134,7 @@ def test_stream_investigation_cli_raises_queued_exception_immediately(
         yield StreamEvent("metadata", data={"run_id": "run-123"})
         raise RuntimeError("stream failed")
 
-    monkeypatch.setattr("app.cli.investigate.LLMSettings.from_env", object)
+    monkeypatch.setattr("app.cli.investigation.investigate.LLMSettings.from_env", object)
     monkeypatch.setattr(
         "app.pipeline.runners.astream_investigation",
         fake_astream_investigation,
@@ -140,3 +146,104 @@ def test_stream_investigation_cli_raises_queued_exception_immediately(
     assert first.event_type == "metadata"
     with pytest.raises(RuntimeError, match="stream failed"):
         next(events)
+
+
+def test_stream_investigation_cli_closes_cleanly_on_generator_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the generator must not hang and must clean up the background thread."""
+    import asyncio
+    import time
+
+    async def fake_astream_investigation(*args: object, **kwargs: object):
+        yield StreamEvent("metadata", data={"run_id": "run-123"})
+        # Simulate a long-running stream
+        await asyncio.sleep(1000)
+
+    monkeypatch.setattr("app.cli.investigation.investigate.LLMSettings.from_env", object)
+    monkeypatch.setattr(
+        "app.pipeline.runners.astream_investigation",
+        fake_astream_investigation,
+    )
+
+    events = stream_investigation_cli(raw_alert={"alert_name": "PayloadAlert"})
+    first = next(events)
+    assert first.event_type == "metadata"
+
+    # Without eager pump cancellation, thread.join() would block for the full timeout (~5s).
+    t0 = time.monotonic()
+    events.close()
+    assert time.monotonic() - t0 < 2.0
+
+
+def test_run_investigation_cli_maps_cli_auth_to_opensre_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> NoReturn:
+        raise CLIAuthenticationRequired(
+            provider="cursor",
+            auth_hint="Run: agent login.",
+            detail="Not logged in.",
+        )
+
+    monkeypatch.setattr("app.cli.investigation.investigate.LLMSettings.from_env", object)
+    monkeypatch.setattr("app.cli.investigation.investigate._call_run_investigation", boom)
+
+    with pytest.raises(OpenSREError, match="not authenticated") as exc_info:
+        run_investigation_cli(raw_alert={"alert_name": "PayloadAlert"})
+    assert exc_info.value.suggestion is not None
+    assert "agent login" in exc_info.value.suggestion
+
+
+def test_stream_investigation_cli_maps_cli_auth_to_opensre_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_astream_investigation(*args: object, **kwargs: object):
+        yield StreamEvent("metadata", data={"run_id": "run-123"})
+        raise CLIAuthenticationRequired(
+            provider="cursor",
+            auth_hint="Run: agent login.",
+            detail="Not logged in.",
+        )
+
+    monkeypatch.setattr("app.cli.investigation.investigate.LLMSettings.from_env", object)
+    monkeypatch.setattr(
+        "app.pipeline.runners.astream_investigation",
+        fake_astream_investigation,
+    )
+
+    events = stream_investigation_cli(raw_alert={"alert_name": "PayloadAlert"})
+    assert next(events).event_type == "metadata"
+    with pytest.raises(OpenSREError, match="not authenticated"):
+        next(events)
+
+
+def test_reraise_cli_runtime_error_maps_cli_auth() -> None:
+    exc = CLIAuthenticationRequired(
+        provider="opencode",
+        auth_hint="Run: opencode auth login",
+        detail="not logged in",
+    )
+
+    with pytest.raises(OpenSREError) as raised:
+        reraise_cli_runtime_error(exc)
+
+    assert str(raised.value) == "opencode CLI is not authenticated."
+    assert raised.value.suggestion == "Run: opencode auth login (not logged in)"
+
+
+def test_reraise_cli_runtime_error_maps_cli_not_found() -> None:
+    exc = RuntimeError("codex CLI not found on PATH")
+
+    with pytest.raises(OpenSREError) as raised:
+        reraise_cli_runtime_error(exc)
+
+    assert str(raised.value) == "CLI tool is not installed or not found."
+    assert raised.value.suggestion == "codex CLI not found on PATH"
+
+
+def test_reraise_cli_runtime_error_reraises_unknown_runtime_error() -> None:
+    exc = RuntimeError("some unrelated runtime failure")
+
+    with pytest.raises(RuntimeError, match="some unrelated runtime failure"):
+        reraise_cli_runtime_error(exc)

@@ -5,14 +5,16 @@ import os
 
 from app.integrations.gitlab import build_gitlab_config, post_gitlab_mr_note
 from app.state import InvestigationState
+from app.utils.truncation import truncate
 
 logger = logging.getLogger(__name__)
 
 
+_GITLAB_MR_NOTE_LIMIT = 4000
+
+
 def _build_mr_note(report: str) -> str:
-    body = report.strip()
-    if len(body) > 4000:
-        body = body[:3997] + "..."
+    body = truncate(report.strip(), _GITLAB_MR_NOTE_LIMIT)
     return f"### RCA Finding\n\n<details>\n<summary>Investigation summary</summary>\n\n{body}\n\n</details>"
 
 
@@ -48,5 +50,5 @@ def post_gitlab_mr_writeback(state: InvestigationState, report: str) -> None:
             body=_build_mr_note(report),
         )
         logger.info("[publish] GitLab MR note posted: project=%s mr_iid=%s", project_id, mr_iid)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("[publish] GitLab MR write-back failed: %s", exc)

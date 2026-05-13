@@ -1,21 +1,47 @@
 """Investigation prompt construction with available actions."""
 
+from typing import Any
+
 from pydantic import BaseModel, ValidationError
 
 from app.nodes.investigate.types import ExecutedHypothesis
 
 
-def _get_executed_sources(executed_hypotheses: list[ExecutedHypothesis]) -> set[str]:
-    """Extract executed sources from hypotheses history."""
-    executed_sources_set = set()
-    for h in executed_hypotheses:
-        sources = h.get("sources", [])
-        if isinstance(sources, list):
-            executed_sources_set.update(sources)
-        single_source = h.get("source")
-        if single_source:
-            executed_sources_set.add(single_source)
-    return executed_sources_set
+def get_blocked_action_names(executed_hypotheses: list[ExecutedHypothesis]) -> set[str]:
+    """Actions that should not be offered again to the planner."""
+    blocked_actions: set[str] = set()
+    for hyp in executed_hypotheses:
+        for field_name in ("actions", "exhausted_actions"):
+            actions_list = hyp.get(field_name, [])
+            if isinstance(actions_list, list):
+                blocked_actions.update(action for action in actions_list if isinstance(action, str))
+    return blocked_actions
+
+
+def _required_param_is_missing(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _has_resolved_required_params(action: Any, available_sources: dict[str, dict]) -> bool:
+    required = getattr(action, "requires", []) or []
+    if not required:
+        return True
+
+    try:
+        extracted = action.extract_params(available_sources)
+    except Exception:
+        return False
+
+    if not isinstance(extracted, dict):
+        return False
+
+    return all(not _required_param_is_missing(extracted.get(param_name)) for param_name in required)
 
 
 def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
@@ -96,15 +122,26 @@ def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
     if "grafana" in available_sources:
         grafana = available_sources["grafana"]
         loki_only = grafana.get("loki_only", False)
+        no_traces = grafana.get("no_traces", False)
         grafana_label = "Grafana Local (Loki only)" if loki_only else "Grafana Cloud"
-        traces_hint = (
-            "" if loki_only else "\n- Use query_grafana_traces to find distributed traces in Tempo"
-        )
+        # The traces action is hard-filtered out of available_actions when
+        # no_traces is set (see GrafanaTracesTool._query_grafana_traces_available),
+        # so the prompt only needs to describe traces when they are actually
+        # selectable. For loki_only stacks Tempo is also absent.
+        if loki_only or no_traces:
+            traces_hint = ""
+        else:
+            traces_hint = (
+                "\n- Use query_grafana_traces to find distributed traces in Tempo"
+                " — only relevant for request-latency or service-mesh incidents,"
+                " NOT for database resource threshold alerts (connections, CPU, storage)"
+            )
         hints.append(
             f"""{grafana_label} Available:
 - Service Name: {grafana.get("service_name")}
 - Pipeline: {grafana.get("pipeline_name")}
 - Use query_grafana_logs to search Loki for pipeline errors, or to fetch AWS Performance Insights and RDS events for database diagnostics{traces_hint}
+- Use query_grafana_metrics for database resource metrics such as FreeStorageSpace, WriteIOPS, CPU, connections, and latency
 - Use query_grafana_alert_rules to inspect alert configuration"""
         )
 
@@ -150,16 +187,28 @@ def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
 - Use search_github_code and get_github_file_contents to trace the failure into code"""
         )
 
-    if "openclaw" in available_sources:
+    if available_sources.get("openclaw", {}).get("connection_verified"):
         openclaw = available_sources["openclaw"]
         endpoint = openclaw.get("openclaw_command") or openclaw.get("openclaw_url") or "unknown"
+        conversation_id = (
+            openclaw.get("openclaw_conversation_id") or openclaw.get("conversation_id") or "unknown"
+        )
+        conversation_hint = (
+            f"- Conversation ID: {conversation_id}\n"
+            "- Start with get_openclaw_conversation to read the full transcript tied to this incident\n"
+            if conversation_id != "unknown"
+            else "- Start with search_openclaw_conversations to find recent threads related to the alert or service\n"
+        )
         hints.append(
-            f"""OpenClaw MCP Available:
+            f"""OpenClaw Context Available:
 - Transport: {openclaw.get("openclaw_mode") or "unknown"}
 - Endpoint: {endpoint}
 - Search hint: {openclaw.get("openclaw_search_query") or "recent conversations"}
-- Start with search_openclaw_conversations to inspect recent OpenClaw context before generic tool calls
-- Use list_openclaw_tools only if you need to inspect the raw bridge surface"""
+- Known conversation available: {"yes" if conversation_id != "unknown" else "no"}
+{conversation_hint.rstrip()}
+- Use get_openclaw_conversation to read the full transcript of any relevant thread before generic bridge calls
+- Use send_openclaw_message only when you have a concrete update to append
+- Use list_openclaw_tools or call_openclaw_tool only if the native conversation actions are insufficient"""
         )
 
     if "vercel" in available_sources and "github" in available_sources:
@@ -252,10 +301,34 @@ def _build_available_sources_hint(available_sources: dict[str, dict]) -> str:
 - Use query_opensearch_analytics for bounded OpenSearch-compatible evidence"""
         )
 
+    if "incident_io" in available_sources:
+        incident_io = available_sources["incident_io"]
+        hints.append(
+            f"""incident.io Available:
+- Incident ID: {incident_io.get("incident_id") or "unknown"}
+- Status category: {incident_io.get("status_category") or "live"}
+- Use incident_io_incidents action="context" when an incident ID is available to read metadata and incident updates
+- Use incident_io_incidents action="list" to find live incidents if no incident ID is known
+- Only use action="append_summary" when findings are ready to write back to the incident summary"""
+        )
+
     if "eks" in available_sources:
         eks = available_sources["eks"]
-        hints.append(
-            f"""EKS Cluster Available:
+        if getattr(eks.get("_backend"), "is_cloudopsbench_backend", False):
+            hints.append(
+                f"""Cloud-OpsBench Kubernetes Snapshot Available:
+- Cluster: {eks.get("cluster_name")}
+- Namespace: {eks.get("namespace", "unknown")}
+- Use the Cloud-OpsBench actions exactly as named in the benchmark:
+  GetResources, DescribeResource, GetClusterConfiguration, GetAlerts,
+  GetErrorLogs, GetRecentLogs, GetServiceDependencies, GetAppYAML,
+  CheckServiceConnectivity, CheckNodeServiceStatus.
+- Prefer the smallest sequence of cache-backed actions that identifies the
+  root cause and supports a strict CloudOps-style final diagnosis."""
+            )
+        else:
+            hints.append(
+                f"""EKS Cluster Available:
 - Cluster: {eks.get("cluster_name")}
 - Namespace: {eks.get("namespace", "unknown")} (may not exist — verify with list_eks_namespaces)
 - Pod: {eks.get("pod_name") or "unknown — use list_eks_pods to discover"}
@@ -268,7 +341,7 @@ IMPORTANT: Always start with discovery actions before fetching specific resource
   4. get_eks_events — get Warning events (OOMKilled, BackOff, FailedScheduling)
   5. get_eks_node_health — check node capacity and pressure conditions
   Only use get_eks_pod_logs / get_eks_deployment_status after confirming the resource exists."""
-        )
+            )
 
     if "upstream_context" in available_sources:
         upstream = available_sources["upstream_context"]
@@ -277,6 +350,16 @@ IMPORTANT: Always start with discovery actions before fetching specific resource
 - {upstream.get("upstream_failure_hint")}
 - Prioritise investigating whether this pipeline consumed bad or missing data from the upstream failure
 - Check S3 input data timestamps and content for evidence of upstream data issues"""
+        )
+
+    if "splunk" in available_sources:
+        splunk = available_sources["splunk"]
+        hints.append(
+            f"""Splunk Available:
+- Base URL: {splunk.get("base_url")}
+- Index: {splunk.get("index", "main")}
+- Default SPL: {splunk.get("default_query")}
+- Use query_splunk_logs to search Splunk for error patterns, exceptions, and application events"""
         )
 
     if hints:
@@ -303,16 +386,10 @@ def build_investigation_prompt(
     Returns:
         Formatted prompt string for LLM
     """
-    executed_actions_flat = set()
-    for hyp in executed_hypotheses:
-        actions_list = hyp.get("actions", [])
-        if isinstance(actions_list, list):
-            executed_actions_flat.update(actions_list)
-
-    executed_actions = sorted(executed_actions_flat)
+    blocked_actions = sorted(get_blocked_action_names(executed_hypotheses))
 
     available_actions_filtered = [
-        action for action in available_actions if action.name not in executed_actions
+        action for action in available_actions if action.name not in blocked_actions
     ]
 
     problem_context = problem_md or "No problem statement available"
@@ -322,6 +399,21 @@ def build_investigation_prompt(
     )
 
     sources_hint = _build_available_sources_hint(available_sources)
+
+    airflow_priority_hint = ""
+    if "airflow" in available_sources:
+        airflow_priority_hint = """
+**Airflow Investigation Priority (MANDATORY):**
+This incident involves Airflow.
+
+You MUST start by using Airflow investigation actions if they are available:
+- get_recent_airflow_failures
+- get_airflow_dag_runs
+
+Do NOT start with generic diagnostic/code or SRE runbook actions before collecting Airflow DAG/task evidence.
+
+Only use generic tools if Airflow tools fail or return no useful data.
+"""
 
     # Build lineage investigation directive if S3 data is available
     lineage_directive = ""
@@ -354,12 +446,13 @@ Problem Context:
 {lineage_directive}
 {memory_section}
 {sources_hint}
+{airflow_priority_hint}
 Available Investigation Actions:
 {actions_description if actions_description else "No actions available"}
 
-Executed Actions: {", ".join(executed_actions) if executed_actions else "None"}
+Blocked Actions: {", ".join(blocked_actions) if blocked_actions else "None"}
 
-Previously executed actions should be treated as already explored evidence paths unless there is a clear reason they may now yield new discriminating evidence.
+Blocked actions are already explored successful evidence paths or exhausted failures. Do not select them again.
 
 Task: Select the most relevant actions to execute now based on the problem context.
 
@@ -390,6 +483,9 @@ Planning rules:
    - background processes (e.g. WAL, vacuum, or audit logging systems depending on the database engine)
    - storage growth sources such as audit logs (for PostgreSQL/Aurora) or other logging mechanisms
    Prefer actions that reveal these mechanisms when relevant signals (CPU, connections, storage) are elevated.
+11. Treat get_sre_guidance as a synthesis helper, not a primary evidence action:
+   - only select it after at least one telemetry action (metrics/logs/events/alerts) succeeds
+   - do not use it when concrete product telemetry actions are still available and untried
 
 When selecting actions, optimize for:
 - ruling out competing explanations
@@ -401,6 +497,8 @@ When selecting actions, optimize for:
 Additionally:
 - When connection counts are high, explicitly evaluate whether idle connections are contributing to the issue and include this explicitly in your reasoning if relevant.
 - When storage pressure is observed, explicitly consider audit logs or database-specific logging mechanisms (e.g. audit_log for PostgreSQL/Aurora)
+- For RDS/Postgres storage alerts, collect metrics, logs/events, and alert rules together when Grafana is available so the final RCA can connect FreeStorageSpace, WriteIOPS, RDS events, and the triggering alert.
+- For RDS/database resource threshold alerts (connections, CPU, storage, IOPS), when Grafana is available: prefer `query_grafana_alert_rules` over `query_grafana_traces`. Alert rules confirm the threshold configuration and the primary metric that fired, which directly anchors the RCA category. Distributed traces (Tempo) are only valuable when the incident is about request latency or service-mesh errors — they contain no useful data for infrastructure ceiling breaches. Do not select `query_grafana_traces` when the alert is clearly firing on a database resource metric.
 
 Avoid:
 - collecting general context that does not help separate hypotheses
@@ -446,16 +544,17 @@ def select_actions(
     Returns:
         Tuple of (available_actions, available_action_names)
     """
-    available_actions = [action for action in actions if action.is_available(available_sources)]
+    available_actions = [
+        action
+        for action in actions
+        if action.is_available(available_sources)
+        and _has_resolved_required_params(action, available_sources)
+    ]
 
-    executed_actions_flat = set()
-    for hyp in executed_hypotheses:
-        actions_list = hyp.get("actions", [])
-        if isinstance(actions_list, list):
-            executed_actions_flat.update(actions_list)
+    blocked_action_names = get_blocked_action_names(executed_hypotheses)
 
     available_actions = [
-        action for action in available_actions if action.name not in executed_actions_flat
+        action for action in available_actions if action.name not in blocked_action_names
     ]
 
     # Apply tool budget to cap the selected tool set

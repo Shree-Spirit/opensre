@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from app.integrations.models import HoneycombIntegrationConfig
+from app.integrations.probes import ProbeResult
 
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _DEFAULT_POLL_ATTEMPTS = 10
@@ -38,6 +39,43 @@ class HoneycombClient:
     def is_configured(self) -> bool:
         return bool(self.config.api_key and self.config.dataset)
 
+    def probe_access(self) -> ProbeResult:
+        """Validate Honeycomb credentials and run a minimal query."""
+        if not self.is_configured:
+            return ProbeResult.missing("Missing Honeycomb API key or dataset.")
+
+        auth_result = self.validate_access()
+        if not auth_result.get("success"):
+            return ProbeResult.failed(
+                f"Auth check failed: {auth_result.get('error', 'unknown error')}"
+            )
+
+        query_result = self.run_query(
+            {
+                "calculations": [{"op": "COUNT"}],
+                "time_range": 900,
+            },
+            limit=1,
+        )
+        if not query_result.get("success"):
+            return ProbeResult.failed(
+                f"Query check failed: {query_result.get('error', 'unknown error')}"
+            )
+
+        environment = auth_result.get("environment", {})
+        environment_slug = (
+            str(environment.get("slug", "")).strip() if isinstance(environment, dict) else ""
+        )
+        environment_label = environment_slug or "classic"
+        return ProbeResult.passed(
+            (
+                f"Connected to {self.config.base_url} "
+                f"(environment {environment_label}) and queried dataset {self.config.dataset}."
+            ),
+            dataset=self.config.dataset,
+            environment=environment_label,
+        )
+
     def validate_access(self) -> dict[str, Any]:
         """Validate the Honeycomb API key against the auth endpoint."""
         try:
@@ -49,7 +87,7 @@ class HoneycombClient:
                 "success": False,
                 "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
             }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return {"success": False, "error": str(exc)}
 
         environment = payload.get("environment", {}) if isinstance(payload, dict) else {}
@@ -72,7 +110,7 @@ class HoneycombClient:
                 "success": False,
                 "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
             }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return {"success": False, "error": str(exc)}
 
         query_id = str(payload.get("id", "")).strip() if isinstance(payload, dict) else ""
@@ -101,7 +139,7 @@ class HoneycombClient:
                 "success": False,
                 "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
             }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return {"success": False, "error": str(exc)}
 
         return {"success": True, "result": result}
@@ -119,7 +157,7 @@ class HoneycombClient:
                 "success": False,
                 "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
             }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return {"success": False, "error": str(exc)}
         return {"success": True, "result": payload}
 

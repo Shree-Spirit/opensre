@@ -1,23 +1,22 @@
 """Main orchestration node for report generation and publishing."""
 
 import logging
-from typing import Optional, cast
 
-from langchain_core.runnables import RunnableConfig
 from langsmith import traceable
 
 from app.masking import MaskingContext
 from app.nodes.publish_findings.formatters.report import (
     build_slack_blocks,
     format_slack_message,
-    get_investigation_url,
+    format_telegram_message,
 )
 from app.nodes.publish_findings.gitlab_writeback import post_gitlab_mr_writeback
 from app.nodes.publish_findings.renderers.editor import open_in_editor
 from app.nodes.publish_findings.renderers.terminal import render_report
 from app.nodes.publish_findings.report_context import build_report_context
 from app.state import InvestigationState
-from app.utils.ingest_delivery import send_ingest
+from app.types.config import NodeConfig
+from app.utils.ingest_delivery import create_investigation_and_attach_url
 
 logger = logging.getLogger(__name__)
 
@@ -37,36 +36,13 @@ def generate_report(state: InvestigationState) -> dict:
     if isinstance(short_summary, str):
         short_summary = masking_ctx.unmask(short_summary)
 
-    # First ingest: persist the report and get back the investigation_id
-    investigation_id: str | None = None
-    try:
-        state_with_report = cast(
-            InvestigationState,
-            {**state, "problem_report": {"report_md": slack_message}, "summary": short_summary},
-        )
-        investigation_id = send_ingest(state_with_report)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[publish] ingest failed: %s", exc)
+    investigation_id, investigation_url = create_investigation_and_attach_url(
+        state,
+        slack_message,
+        short_summary,
+    )
 
-    investigation_url = get_investigation_url(state.get("organization_slug"), investigation_id)
-
-    # Second ingest: update the record with the investigation_url so the web app can link to it
-    if investigation_id:
-        try:
-            state_with_url = cast(
-                InvestigationState,
-                {
-                    **state,
-                    "problem_report": {
-                        "report_md": slack_message,
-                        "investigation_url": investigation_url,
-                    },
-                    "summary": short_summary,
-                },
-            )
-            send_ingest(state_with_url)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[publish] ingest url update failed: %s", exc)
+    telegram_message = masking_ctx.unmask(format_telegram_message(ctx))
 
     all_blocks = build_slack_blocks(ctx) + build_action_blocks(investigation_url, investigation_id)
     all_blocks = masking_ctx.unmask_value(all_blocks)
@@ -166,7 +142,7 @@ def generate_report(state: InvestigationState) -> dict:
         )
         if bot_token and chat_id:
             tg_posted, tg_error = send_telegram_report(
-                slack_message,
+                telegram_message,
                 {"bot_token": bot_token, "chat_id": chat_id, "reply_to_message_id": reply_to},
             )
             logger.debug("[publish] telegram delivery: posted=%s error=%s", tg_posted, tg_error)
@@ -185,6 +161,17 @@ def generate_report(state: InvestigationState) -> dict:
     else:
         logger.debug("[publish] telegram delivery: no telegram integration configured")
 
+    openclaw_creds = resolved.get("openclaw", {})
+    if openclaw_creds:
+        from app.utils.openclaw_delivery import send_openclaw_report
+
+        oc_posted, oc_error = send_openclaw_report(state, slack_message, openclaw_creds)
+        logger.debug("[publish] openclaw delivery: posted=%s error=%s", oc_posted, oc_error)
+        if not oc_posted:
+            logger.warning("[publish] OpenClaw delivery failed: %s", oc_error)
+    else:
+        logger.debug("[publish] openclaw delivery: no openclaw integration configured")
+
     post_gitlab_mr_writeback(state, slack_message)
 
     return {"slack_message": slack_message, "report": slack_message}
@@ -193,7 +180,8 @@ def generate_report(state: InvestigationState) -> dict:
 @traceable(name="node_publish_findings")
 def node_publish_findings(
     state: InvestigationState,
-    config: Optional[RunnableConfig] = None,  # noqa: ARG001,UP007,UP045
+    config: NodeConfig | None = None,
 ) -> dict:
     """LangGraph node wrapper with LangSmith tracking."""
+    del config
     return generate_report(state)

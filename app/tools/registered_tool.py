@@ -127,6 +127,7 @@ class RegisteredTool:
     input_schema: dict[str, Any]
     source: EvidenceSource
     run: Callable[..., Any] = field(repr=False)
+    display_name: str | None = None
     surfaces: tuple[ToolSurface, ...] = _DEFAULT_SURFACES
     use_cases: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
@@ -144,6 +145,10 @@ class RegisteredTool:
     )
     tags: tuple[str, ...] = ()
     cost_tier: CostTier | None = None
+    requires_approval: bool = False
+    approval_reason: str = ""
+    approval_expiry_seconds: int = 300
+    approval_scope: str = "one_shot"
     origin_module: str = ""
     origin_name: str = ""
 
@@ -152,6 +157,7 @@ class RegisteredTool:
             {
                 "name": self.name,
                 "description": self.description,
+                "display_name": self.display_name,
                 "input_schema": self.input_schema,
                 "source": self.source,
                 "use_cases": self.use_cases,
@@ -162,6 +168,7 @@ class RegisteredTool:
         )
         self.name = metadata.name
         self.description = metadata.description
+        self.display_name = metadata.display_name
         self.input_schema = metadata.input_schema
         self.source = metadata.source
         self.use_cases = metadata.use_cases
@@ -225,6 +232,7 @@ class RegisteredTool:
         return cls(
             name=metadata.name,
             description=metadata.description,
+            display_name=metadata.display_name,
             input_schema=metadata.input_schema,
             source=metadata.source,
             use_cases=metadata.use_cases,
@@ -237,6 +245,10 @@ class RegisteredTool:
             extract_params=tool.extract_params,
             tags=resolved_tags,
             cost_tier=resolved_cost_tier,
+            requires_approval=getattr(tool.__class__, "requires_approval", False),
+            approval_reason=getattr(tool.__class__, "approval_reason", ""),
+            approval_expiry_seconds=getattr(tool.__class__, "approval_expiry_seconds", 300),
+            approval_scope=getattr(tool.__class__, "approval_scope", "one_shot"),
             origin_module=tool.__class__.__module__,
             origin_name=tool.__class__.__name__,
         )
@@ -248,6 +260,7 @@ class RegisteredTool:
         *,
         name: str | None = None,
         description: str | None = None,
+        display_name: str | None = None,
         input_schema: dict[str, Any] | None = None,
         source: EvidenceSource | None,
         surfaces: Iterable[str] | None = None,
@@ -267,6 +280,7 @@ class RegisteredTool:
         return cls(
             name=name or func.__name__,
             description=description or inferred_description,
+            display_name=display_name,
             input_schema=input_schema or infer_input_schema(func),
             source=source,
             surfaces=_normalize_surfaces(surfaces),

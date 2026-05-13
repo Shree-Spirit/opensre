@@ -11,12 +11,30 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-from anthropic import Anthropic, AnthropicBedrock, AuthenticationError
+if TYPE_CHECKING:
+    from app.integrations.llm_cli.registry import CLIProviderRegistration
+
+import boto3
+import botocore.exceptions
+from anthropic import (
+    Anthropic,
+    AnthropicBedrock,
+    AuthenticationError,
+    NotFoundError,
+    PermissionDeniedError,
+)
+from anthropic import BadRequestError as AnthropicBadRequestError
+from openai import APIConnectionError as OpenAIConnectionError
+from openai import APITimeoutError as OpenAITimeoutError
 from openai import AuthenticationError as OpenAIAuthError
+from openai import BadRequestError as OpenAIBadRequestError
+from openai import NotFoundError as OpenAINotFoundError
 from openai import OpenAI
+from openai import RateLimitError as OpenAIRateLimitError
 from pydantic import BaseModel, ValidationError
 
 from app.config import (
@@ -29,6 +47,8 @@ from app.config import (
     LLMSettings,
 )
 from app.llm_credentials import resolve_llm_api_key
+from app.llm_reasoning_effort import get_active_reasoning_effort
+from app.types.root_cause_categories import VALID_ROOT_CAUSE_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +57,30 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-_VALID_ROOT_CAUSE_CATEGORIES = frozenset(
-    {
-        "configuration_error",
-        "code_defect",
-        "data_quality",
-        "resource_exhaustion",
-        "dependency_failure",
-        "infrastructure",
-        "healthy",
-        "unknown",
-    }
-)
+# The canonical taxonomy for root cause categories lives in
+# ``app.types.root_cause_categories``. This module only consumes the
+# resulting set (``VALID_ROOT_CAUSE_CATEGORIES``) for membership checks
+# while parsing LLM responses; it does not own or extend the taxonomy.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Retry / timeout policy — shared across providers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Initial backoff for transient API failures (5xx, overloaded). Doubles each
+# attempt: 1s → 2s → 4s. Tuned for short-lived Anthropic / OpenAI overloads
+# that typically clear within ~10s while still failing fast on hard errors.
+_RETRY_INITIAL_BACKOFF_SEC = 1.0
+
+# Total number of attempts (initial + retries). With the doubling backoff
+# above, three attempts cover ~7s of upstream recovery before surfacing the
+# error to the user.
+_RETRY_MAX_ATTEMPTS = 3
+
+# HTTP client timeout for blocking and streaming SDK calls. 60s gives long
+# generations (Opus, GPT-5) headroom while preventing indefinite hangs on
+# silent network drops.
+_CLIENT_TIMEOUT_SEC = 60.0
 
 
 @dataclass(frozen=True)
@@ -58,6 +90,7 @@ class RootCauseResult:
     validated_claims: list[str]
     non_validated_claims: list[str]
     causal_chain: list[str]
+    remediation_steps: list[str]
 
 
 @dataclass(frozen=True)
@@ -71,7 +104,7 @@ class LLMClient:
     ) -> None:
         api_key = resolve_llm_api_key("ANTHROPIC_API_KEY")
         self._api_key = api_key
-        self._client = Anthropic(api_key=api_key, timeout=60.0)
+        self._client = Anthropic(api_key=api_key, timeout=_CLIENT_TIMEOUT_SEC)
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -93,13 +126,18 @@ class LLMClient:
             )
         if api_key != self._api_key:
             self._api_key = api_key
-            self._client = Anthropic(api_key=api_key, timeout=60.0)
+            self._client = Anthropic(api_key=api_key, timeout=_CLIENT_TIMEOUT_SEC)
 
-    def invoke(self, prompt_or_messages: Any) -> LLMResponse:
+    def _build_request_kwargs(self, prompt_or_messages: Any) -> dict[str, Any]:
+        """Refresh credentials, normalize messages, apply guardrails, and build API kwargs.
+
+        Shared by ``invoke`` and ``invoke_stream`` so both paths apply the same
+        pre-flight (credential refresh, guardrail redaction, kwargs shape).
+        """
         self._ensure_client()
         system, messages = _normalize_messages(prompt_or_messages)
 
-        from app.guardrails.engine import GuardrailBlockedError, get_guardrail_engine
+        from app.guardrails.engine import get_guardrail_engine
 
         engine = get_guardrail_engine()
         if engine.is_active:
@@ -117,9 +155,15 @@ class LLMClient:
             kwargs["system"] = system
         if self._temperature is not None:
             kwargs["temperature"] = self._temperature
+        return kwargs
 
-        backoff_seconds = 1.0
-        max_attempts = 3
+    def invoke(self, prompt_or_messages: Any) -> LLMResponse:
+        from app.guardrails.engine import GuardrailBlockedError
+
+        kwargs = self._build_request_kwargs(prompt_or_messages)
+
+        backoff_seconds = _RETRY_INITIAL_BACKOFF_SEC
+        max_attempts = _RETRY_MAX_ATTEMPTS
         last_err: Exception | None = None
         for attempt in range(max_attempts):
             try:
@@ -129,6 +173,13 @@ class LLMClient:
                 raise RuntimeError(
                     "Anthropic authentication failed. Check ANTHROPIC_API_KEY in your environment or .env."
                 ) from err
+            except NotFoundError as err:
+                raise RuntimeError(
+                    f"Anthropic model '{self._model}' was not found. "
+                    "Check your configured model name and try again."
+                ) from err
+            except AnthropicBadRequestError as err:
+                raise RuntimeError(f"Anthropic request rejected (HTTP 400): {err.message}") from err
             except GuardrailBlockedError:
                 raise
             except Exception as err:
@@ -143,17 +194,102 @@ class LLMClient:
         content = _extract_text(response)
         return LLMResponse(content=content)
 
+    def invoke_stream(self, prompt_or_messages: Any) -> Iterator[str]:
+        """Yield text chunks as the model emits them.
+
+        Retries transient failures (e.g. ``529 overloaded_error``, network
+        blips) **only before any chunk has been yielded** — once the first
+        token has reached the caller, retrying would duplicate visible output,
+        so any post-emission failure propagates immediately. Auth and
+        guardrail errors never retry.
+        """
+        from app.guardrails.engine import GuardrailBlockedError
+
+        kwargs = self._build_request_kwargs(prompt_or_messages)
+
+        backoff_seconds = _RETRY_INITIAL_BACKOFF_SEC
+        max_attempts = _RETRY_MAX_ATTEMPTS
+        for attempt in range(max_attempts):
+            emitted = False
+            try:
+                with self._client.messages.stream(**kwargs) as stream:
+                    for text in stream.text_stream:
+                        emitted = True
+                        yield text
+                return
+            except AuthenticationError as err:
+                raise RuntimeError(
+                    "Anthropic authentication failed. Check ANTHROPIC_API_KEY in your environment or .env."
+                ) from err
+            except NotFoundError as err:
+                raise RuntimeError(
+                    f"Anthropic model '{self._model}' was not found. "
+                    "Check your configured model name and try again."
+                ) from err
+            except AnthropicBadRequestError as err:
+                raise RuntimeError(f"Anthropic request rejected (HTTP 400): {err.message}") from err
+            except GuardrailBlockedError:
+                raise
+            except Exception as err:
+                if emitted:
+                    # Mid-stream failure: never retry — chunks are already on
+                    # the user's screen and a retry would duplicate them.
+                    raise
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(_format_anthropic_retry_error(err)) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+
+
+def _is_anthropic_bedrock_model(model_id: str) -> bool:
+    """Return True when *model_id* should be routed through the AnthropicBedrock SDK.
+
+    Anthropic model IDs on Bedrock look like:
+      - ``anthropic.claude-*``
+      - ``us.anthropic.claude-*``  (cross-region inference profiles)
+      - ``arn:aws:bedrock:*:foundation-model/anthropic.claude-*``
+      - ``arn:aws:bedrock:*:application-inference-profile/*`` (unknown vendor → Converse)
+
+    For ARN-based application inference profiles we cannot tell the backing
+    foundation model from the ID alone (it may point at Mistral, Llama, etc.).
+    Those ARNs route to the model-agnostic Converse API rather than forcing
+    the Anthropic SDK (which would fail for non-Claude pools).
+    """
+    model_lower = model_id.lower()
+    if "anthropic.claude" in model_lower:
+        return True
+    # Application inference profile ARNs encode no vendor — use converse (all models).
+    if model_lower.startswith("arn:") and "application-inference-profile" in model_lower:
+        return False
+    # Anything else (mistral.*, openai.*, meta.*, etc.) → boto3 converse
+    return False
+
 
 class BedrockLLMClient:
-    """LLM client using Anthropic models via Amazon Bedrock (IAM auth, no API key)."""
+    """LLM client for Amazon Bedrock (IAM auth, no API key).
+
+    Supports **all** Bedrock models:
+    - Anthropic Claude models → AnthropicBedrock SDK (existing behaviour)
+    - Non-Anthropic models (Mistral, GPT OSS, Llama, etc.) → boto3 ``converse`` API
+    """
 
     def __init__(
         self, *, model: str, max_tokens: int = 1024, temperature: float | None = None
     ) -> None:
-        self._client = AnthropicBedrock(aws_region=os.getenv("AWS_REGION", "us-east-1"))
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._use_anthropic = _is_anthropic_bedrock_model(model)
+        self._aws_region = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
+
+        if self._use_anthropic:
+            self._anthropic_client: AnthropicBedrock | None = AnthropicBedrock(
+                aws_region=self._aws_region
+            )
+            self._boto3_client: Any = None
+        else:
+            self._anthropic_client = None
+            self._boto3_client = boto3.client("bedrock-runtime", region_name=self._aws_region)
 
     def with_config(self, **_kwargs: Any) -> BedrockLLMClient:
         return self
@@ -164,7 +300,9 @@ class BedrockLLMClient:
     def bind_tools(self, _tools: list[Any]) -> BedrockLLMClient:
         return self
 
-    def invoke(self, prompt_or_messages: Any) -> LLMResponse:
+    def _invoke_anthropic(self, prompt_or_messages: Any) -> LLMResponse:
+        """Invoke via AnthropicBedrock SDK (Claude models only)."""
+        assert self._anthropic_client is not None
         system, messages = _normalize_messages(prompt_or_messages)
 
         from app.guardrails.engine import GuardrailBlockedError, get_guardrail_engine
@@ -186,15 +324,43 @@ class BedrockLLMClient:
         if self._temperature is not None:
             kwargs["temperature"] = self._temperature
 
-        backoff_seconds = 1.0
-        max_attempts = 3
+        backoff_seconds = _RETRY_INITIAL_BACKOFF_SEC
+        max_attempts = _RETRY_MAX_ATTEMPTS
         last_err: Exception | None = None
         for attempt in range(max_attempts):
             try:
-                response = self._client.messages.create(**kwargs)
+                response = self._anthropic_client.messages.create(**kwargs)
                 break
+            except AnthropicBadRequestError as err:
+                err_msg = str(err)
+                if "on-demand throughput" in err_msg or "inference profile" in err_msg.lower():
+                    raise RuntimeError(
+                        f"Bedrock model '{self._model}' requires a cross-region inference profile. "
+                        f"Try prefixing with 'us.' (e.g. 'us.{self._model}') and update "
+                        "BEDROCK_REASONING_MODEL or BEDROCK_TOOLCALL_MODEL."
+                    ) from err
+                raise RuntimeError(
+                    f"Bedrock Anthropic request rejected (HTTP 400) for model "
+                    f"'{self._model}': {err.message}"
+                ) from err
             except GuardrailBlockedError:
                 raise
+            except AuthenticationError as err:
+                raise RuntimeError(
+                    f"Bedrock authentication failed for model '{self._model}'. "
+                    "Check AWS credentials, region configuration, and Bedrock access."
+                ) from err
+            except NotFoundError as err:
+                raise RuntimeError(
+                    f"Bedrock model '{self._model}' was not found or has reached end-of-life. "
+                    "Update BEDROCK_REASONING_MODEL or BEDROCK_TOOLCALL_MODEL to a supported model."
+                ) from err
+            except PermissionDeniedError as err:
+                raise RuntimeError(
+                    f"Bedrock model '{self._model}' is not available for your account. "
+                    "Check your AWS Marketplace subscription and account permissions, "
+                    "or update BEDROCK_REASONING_MODEL / BEDROCK_TOOLCALL_MODEL."
+                ) from err
             except Exception as err:
                 last_err = err
                 if attempt == max_attempts - 1:
@@ -209,6 +375,136 @@ class BedrockLLMClient:
         content = _extract_text(response)
         return LLMResponse(content=content)
 
+    def _invoke_converse(self, prompt_or_messages: Any) -> LLMResponse:
+        """Invoke via boto3 converse API (works with all Bedrock models)."""
+        assert self._boto3_client is not None
+        system, messages = _normalize_messages(prompt_or_messages)
+
+        from app.guardrails.engine import GuardrailBlockedError, get_guardrail_engine
+
+        engine = get_guardrail_engine()
+        if engine.is_active:
+            for msg in messages:
+                msg["content"] = engine.apply(msg["content"])
+            if system:
+                system = engine.apply(system)
+
+        # Convert to converse API message format ({ "text": "..." } blocks only).
+        converse_messages = [
+            {"role": msg["role"], "content": [{"text": msg["content"]}]} for msg in messages
+        ]
+
+        kwargs: dict[str, Any] = {
+            "modelId": self._model,
+            "messages": converse_messages,
+            "inferenceConfig": {"maxTokens": self._max_tokens},
+        }
+        if system:
+            kwargs["system"] = [{"text": system}]
+        if self._temperature is not None:
+            kwargs["inferenceConfig"]["temperature"] = self._temperature
+
+        backoff_seconds = _RETRY_INITIAL_BACKOFF_SEC
+        max_attempts = _RETRY_MAX_ATTEMPTS
+        last_err: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                response = self._boto3_client.converse(**kwargs)
+                break
+            except GuardrailBlockedError:
+                raise
+            except botocore.exceptions.ClientError as err:
+                code = err.response.get("Error", {}).get("Code", "")
+                if code == "ValidationException":
+                    raise RuntimeError(
+                        f"Bedrock model ID '{self._model}' is invalid. "
+                        "Check BEDROCK_REASONING_MODEL or BEDROCK_TOOLCALL_MODEL."
+                    ) from err
+                if code == "ResourceNotFoundException":
+                    raise RuntimeError(
+                        f"Bedrock model '{self._model}' was not found in the configured region. "
+                        "Check the model ID, region, or inference profile."
+                    ) from err
+                if code in ("AccessDeniedException", "UnauthorizedException"):
+                    # AccessDeniedException is overloaded on Bedrock: it can mean
+                    # missing IAM, missing per-region/per-model Bedrock access
+                    # opt-in, or an AWS Marketplace billing problem (e.g.
+                    # ``INVALID_PAYMENT_INSTRUMENT``). Surface the upstream
+                    # AWS-provided reason so the user knows which one to fix
+                    # — see issue #1808.
+                    err_msg = err.response.get("Error", {}).get("Message", "") or ""
+                    err_msg_str = str(err_msg)
+                    if (
+                        "INVALID_PAYMENT_INSTRUMENT" in err_msg_str
+                        or "payment instrument" in err_msg_str.lower()
+                    ):
+                        aws_message = err_msg_str.strip().rstrip(".")
+                        detail = f" Cause: {aws_message}." if aws_message else ""
+                        raise RuntimeError(
+                            f"Access denied for Bedrock model '{self._model}'.{detail} "
+                            "A valid AWS payment instrument is required — add a payment method "
+                            "to your AWS account or check your AWS Marketplace subscription."
+                        ) from err
+                    aws_message = err_msg_str.strip().rstrip(".")
+                    detail = f" Cause: {aws_message}." if aws_message else ""
+                    raise RuntimeError(
+                        f"Access denied for Bedrock model '{self._model}'.{detail} "
+                        "Check Bedrock model access (per-region opt-in), your "
+                        "AWS Marketplace subscription / payment method, and "
+                        "IAM permissions."
+                    ) from err
+                last_err = err
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        f"Bedrock API request failed after {max_attempts} attempts: {type(err).__name__}: {err}"
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+            except Exception as err:
+                last_err = err
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        f"Bedrock API request failed after {max_attempts} attempts: {type(err).__name__}: {err}"
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+        else:
+            raise RuntimeError("Bedrock invocation failed without a concrete error") from last_err
+
+        # Extract text from converse response
+        output_message = response.get("output", {}).get("message", {})
+        content_blocks = output_message.get("content", [])
+        text_parts: list[str] = []
+        for block in content_blocks:
+            if "text" in block:
+                text_parts.append(block["text"])
+        content = "\n".join(text_parts).strip()
+        if not content:
+            stop_reason = response.get("stopReason")
+            logger.warning(
+                "Bedrock converse returned no text blocks (stopReason=%s); raw response: %s",
+                stop_reason,
+                response,
+            )
+            raise RuntimeError(
+                f"Bedrock converse returned no text content (stopReason={stop_reason!r})"
+            )
+        return LLMResponse(content=content)
+
+    def invoke(self, prompt_or_messages: Any) -> LLMResponse:
+        if self._use_anthropic:
+            return self._invoke_anthropic(prompt_or_messages)
+        return self._invoke_converse(prompt_or_messages)
+
+    def invoke_stream(self, prompt_or_messages: Any) -> Iterator[str]:
+        """Yield the full response as one chunk; real streaming is a follow-up.
+
+        Bedrock supports token streaming via ``AnthropicBedrock.messages.stream``
+        and ``boto3 converse_stream``, but wiring those paths is deferred —
+        the yield-once fallback satisfies the protocol contract.
+        """
+        yield self.invoke(prompt_or_messages).content
+
 
 def _format_anthropic_retry_error(err: Exception) -> str:
     """Format a user-facing Anthropic retry failure message."""
@@ -219,7 +515,13 @@ def _format_anthropic_retry_error(err: Exception) -> str:
             "Anthropic API connection failed after multiple retries. "
             "Check network access and try again."
         )
-    if status_code == 529:
+    # Detect overloaded via HTTP status (error-response path) or via body error
+    # type (SSE streaming path: the SDK raises APIStatusError from body events
+    # where the initial HTTP response was 200, so status_code is absent/not 529).
+    body = getattr(err, "body", None)
+    error_obj = body.get("error") if isinstance(body, dict) else None
+    body_error_type = error_obj.get("type", "") if isinstance(error_obj, dict) else ""
+    if status_code == 529 or body_error_type == "overloaded_error":
         return (
             "Anthropic API is overloaded (HTTP 529) after multiple retries. "
             "Try again in a few seconds."
@@ -227,9 +529,68 @@ def _format_anthropic_retry_error(err: Exception) -> str:
     return f"Anthropic API request failed after multiple retries: {error_name}."
 
 
+def _format_openai_connection_error(err: Exception, provider_label: str) -> str:
+    """Return a user-facing message for an OpenAI APIConnectionError."""
+    if isinstance(err, OpenAITimeoutError):
+        return (
+            f"{provider_label} API request timed out. "
+            "Check that the service is running and responsive at the configured endpoint."
+        )
+    cause: BaseException | None = err
+    cause_text_parts: list[str] = []
+    while cause is not None:
+        cause_text_parts.append(str(cause).lower())
+        next_cause = getattr(cause, "__cause__", None)
+        if next_cause is None:
+            next_cause = getattr(cause, "__context__", None)
+        cause = next_cause
+
+    cause_text = " ".join(cause_text_parts)
+    if "ssl" in cause_text or "wrong_version_number" in cause_text or "certificate" in cause_text:
+        return (
+            f"Cannot connect to {provider_label} API (SSL/TLS error). "
+            "Verify the endpoint URL uses HTTPS and that no proxy is stripping TLS."
+        )
+    return (
+        f"Cannot connect to {provider_label} API. "
+        "Check your network connection and that the endpoint URL is reachable."
+    )
+
+
+def _parse_retry_after(err: Exception) -> float:
+    """Extract the suggested retry delay in seconds from a RateLimitError.
+
+    Google/Gemini embeds the delay in the error body's ``details`` array as a
+    ``retryDelay`` field (e.g. ``"5s"``), and also in the human-readable
+    message (``"Please retry in 5.478238622s"``).  Returns 0 if nothing is
+    found so callers can fall back to their own backoff.
+    """
+    body = getattr(err, "body", None)
+    if isinstance(body, dict):
+        error_obj = body.get("error", {})
+        if isinstance(error_obj, dict):
+            for detail in error_obj.get("details", []):
+                delay_str = detail.get("retryDelay", "")
+                if delay_str:
+                    m = re.search(r"^(\d+(?:\.\d+)?)\s*s$", str(delay_str).strip())
+                    if m:
+                        return min(float(m.group(1)), 60.0)
+    m = re.search(r"[Rr]etry in (\d+(?:\.\d+)?)s", str(err))
+    if m:
+        return min(float(m.group(1)), 60.0)
+    return 0.0
+
+
 def _uses_max_completion_tokens(model: str) -> bool:
     """Reasoning models (o1, o3, o4, gpt-5 series) require max_completion_tokens."""
     return model.startswith(("o1", "o3", "o4", "gpt-5"))
+
+
+def _resolve_openai_reasoning_effort(*, model: str, api_key_env: str) -> str | None:
+    """Session override for OpenAI reasoning models in the interactive shell."""
+    if api_key_env != "OPENAI_API_KEY" or not _uses_max_completion_tokens(model):
+        return None
+    return get_active_reasoning_effort()
 
 
 class OpenAILLMClient:
@@ -242,17 +603,27 @@ class OpenAILLMClient:
         base_url: str | None = None,
         api_key_env: str = "OPENAI_API_KEY",
         api_key_default: str = "",
+        default_headers: dict[str, str] | None = None,
     ) -> None:
         api_key = resolve_llm_api_key(api_key_env) or api_key_default
         self._api_key = api_key
         self._api_key_default = api_key_default
         self._base_url = base_url
         self._api_key_env = api_key_env
+        self._default_headers = default_headers
         self._provider_label = api_key_env.removesuffix("_API_KEY").replace("_", " ").title()
-        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
+        self._client: OpenAI | None = None
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
+
+    def _build_client(self, api_key: str) -> OpenAI:
+        return OpenAI(
+            api_key=api_key,
+            base_url=self._base_url,
+            timeout=_CLIENT_TIMEOUT_SEC,
+            default_headers=self._default_headers,
+        )
 
     def with_config(self, **_kwargs) -> OpenAILLMClient:
         return self
@@ -263,21 +634,27 @@ class OpenAILLMClient:
     def bind_tools(self, _tools: list) -> OpenAILLMClient:
         return self
 
-    def _ensure_client(self) -> None:
+    def _ensure_client(self) -> OpenAI:
         api_key = resolve_llm_api_key(self._api_key_env) or self._api_key_default
         if not api_key:
             raise RuntimeError(
                 f"Missing {self._api_key_env}. Set it in your environment, .env, or secure local keychain before running LLM steps."
             )
-        if api_key != self._api_key:
+        if self._client is None or api_key != self._api_key:
             self._api_key = api_key
-            self._client = OpenAI(api_key=api_key, base_url=self._base_url, timeout=60.0)
+            self._client = self._build_client(api_key)
+        return self._client
 
-    def invoke(self, prompt_or_messages: Any) -> LLMResponse:
+    def _build_request_kwargs(self, prompt_or_messages: Any) -> dict[str, Any]:
+        """Refresh credentials, normalize messages, apply guardrails, and build API kwargs.
+
+        Shared by ``invoke`` and ``invoke_stream`` so both paths apply the same
+        pre-flight (credential refresh, guardrail redaction, kwargs shape).
+        """
         self._ensure_client()
         messages = _normalize_messages_openai(prompt_or_messages)
 
-        from app.guardrails.engine import GuardrailBlockedError, get_guardrail_engine
+        from app.guardrails.engine import get_guardrail_engine
 
         engine = get_guardrail_engine()
         if engine.is_active:
@@ -292,22 +669,78 @@ class OpenAILLMClient:
             token_param: self._max_tokens,
             "messages": messages,
         }
+        reasoning_effort = _resolve_openai_reasoning_effort(
+            model=self._model,
+            api_key_env=self._api_key_env,
+        )
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         if self._temperature is not None:
             kwargs["temperature"] = self._temperature
+        return kwargs
 
-        backoff_seconds = 1.0
-        max_attempts = 3
+    def invoke(self, prompt_or_messages: Any) -> LLMResponse:
+        from app.guardrails.engine import GuardrailBlockedError
+
+        # Build kwargs first (also calls _ensure_client internally) so the
+        # captured client below reflects the latest key — guards against a
+        # rotation between the two _ensure_client invocations.
+        kwargs = self._build_request_kwargs(prompt_or_messages)
+        client = self._ensure_client()
+
+        backoff_seconds = _RETRY_INITIAL_BACKOFF_SEC
+        max_attempts = _RETRY_MAX_ATTEMPTS
         last_err: Exception | None = None
         for attempt in range(max_attempts):
             try:
-                response = self._client.chat.completions.create(**kwargs)
+                response = client.chat.completions.create(**kwargs)
                 break
             except OpenAIAuthError as err:
                 raise RuntimeError(
                     f"{self._provider_label} authentication failed. Check {self._api_key_env} in your environment, .env, or secure local keychain."
                 ) from err
+            except OpenAINotFoundError as err:
+                raise RuntimeError(
+                    f"{self._provider_label} model '{self._model}' was not found. "
+                    "Check your configured model name or endpoint."
+                ) from err
+            except OpenAIBadRequestError as err:
+                raise RuntimeError(
+                    f"{self._provider_label} request rejected (HTTP 400): {err.message}"
+                ) from err
             except GuardrailBlockedError:
                 raise
+            except OpenAITimeoutError as err:
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        _format_openai_connection_error(err, self._provider_label)
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+            except OpenAIConnectionError as err:
+                raise RuntimeError(
+                    _format_openai_connection_error(err, self._provider_label)
+                ) from err
+            except OpenAIRateLimitError as err:
+                body = getattr(err, "body", None)
+                if (
+                    isinstance(body, dict)
+                    and body.get("error", {}).get("code") == "insufficient_quota"
+                ):
+                    raise RuntimeError(
+                        f"{self._provider_label} billing quota exceeded. "
+                        "Check your plan and billing details."
+                    ) from err
+                last_err = err
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        f"{self._provider_label} rate limit exceeded (HTTP 429) after multiple retries. "
+                        "Check your quota and billing details."
+                    ) from err
+                suggested = _parse_retry_after(err)
+                wait = max(suggested, backoff_seconds)
+                time.sleep(wait)
+                backoff_seconds = wait * 2
             except Exception as err:
                 last_err = err
                 if attempt == max_attempts - 1:
@@ -323,6 +756,98 @@ class OpenAILLMClient:
             raise RuntimeError("OpenAI API returned an empty choices list")
         content = response.choices[0].message.content or ""
         return LLMResponse(content=content.strip())
+
+    def invoke_stream(self, prompt_or_messages: Any) -> Iterator[str]:
+        """Yield text chunks as the model emits them.
+
+        Retries transient failures (overloaded, network blips) **only before
+        any chunk has been yielded** — once a token has reached the caller,
+        retrying would duplicate visible output, so post-emission failures
+        propagate. Auth and guardrail errors never retry.
+        """
+        from app.guardrails.engine import GuardrailBlockedError
+
+        # Build kwargs first (also calls _ensure_client internally) so the
+        # captured client below reflects the latest key — same rotation
+        # guard as ``invoke``.
+        kwargs = self._build_request_kwargs(prompt_or_messages)
+        client = self._ensure_client()
+
+        backoff_seconds = _RETRY_INITIAL_BACKOFF_SEC
+        max_attempts = _RETRY_MAX_ATTEMPTS
+        for attempt in range(max_attempts):
+            emitted = False
+            try:
+                for chunk in client.chat.completions.create(stream=True, **kwargs):
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        emitted = True
+                        yield delta
+                return
+            except OpenAIAuthError as err:
+                raise RuntimeError(
+                    f"{self._provider_label} authentication failed. Check {self._api_key_env} in your environment, .env, or secure local keychain."
+                ) from err
+            except OpenAINotFoundError as err:
+                raise RuntimeError(
+                    f"{self._provider_label} model '{self._model}' was not found. "
+                    "Check your configured model name or endpoint."
+                ) from err
+            except OpenAIBadRequestError as err:
+                raise RuntimeError(
+                    f"{self._provider_label} request rejected (HTTP 400): {err.message}"
+                ) from err
+            except GuardrailBlockedError:
+                raise
+            except OpenAITimeoutError as err:
+                if emitted:
+                    raise
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        _format_openai_connection_error(err, self._provider_label)
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
+            except OpenAIConnectionError as err:
+                if emitted:
+                    raise
+                raise RuntimeError(
+                    _format_openai_connection_error(err, self._provider_label)
+                ) from err
+            except OpenAIRateLimitError as err:
+                body = getattr(err, "body", None)
+                if (
+                    isinstance(body, dict)
+                    and body.get("error", {}).get("code") == "insufficient_quota"
+                ):
+                    raise RuntimeError(
+                        f"{self._provider_label} billing quota exceeded. "
+                        "Check your plan and billing details."
+                    ) from err
+                if emitted:
+                    raise
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        f"{self._provider_label} rate limit exceeded (HTTP 429) after multiple retries. "
+                        "Check your quota and billing details."
+                    ) from err
+                suggested = _parse_retry_after(err)
+                wait = max(suggested, backoff_seconds)
+                time.sleep(wait)
+                backoff_seconds = wait * 2
+            except Exception as err:
+                if emitted:
+                    # Mid-stream failure: never retry — chunks are already on
+                    # the user's screen and a retry would duplicate them.
+                    raise
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(
+                        "LLM API request failed after multiple retries. Try again in a few seconds."
+                    ) from err
+                time.sleep(backoff_seconds)
+                backoff_seconds *= 2
 
 
 class StructuredOutputClient:
@@ -363,6 +888,9 @@ class SupportsLLMInvoke(Protocol):
         pass
 
     def invoke(self, prompt_or_messages: Any) -> LLMResponse:
+        pass
+
+    def invoke_stream(self, prompt_or_messages: Any) -> Iterator[str]:
         pass
 
 
@@ -423,6 +951,15 @@ def _extract_json_payload(text: str) -> Any:
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
         cleaned = cleaned.strip()
+    else:
+        # LLM may prefix the code block with prose ("Here is the JSON:")
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+            try:
+                return _safe_json_loads(candidate)
+            except json.JSONDecodeError:
+                pass
 
     try:
         return _safe_json_loads(cleaned)
@@ -453,53 +990,85 @@ def _extract_json_payload(text: str) -> Any:
 # Protocol keeps static type safety for CLI-backed clients without runtime import cycles.
 _LLMClientType = LLMClient | OpenAILLMClient | BedrockLLMClient | SupportsLLMInvoke
 _llm: _LLMClientType | None = None
+_llm_for_classification: _LLMClientType | None = None
 _llm_for_tools: _LLMClientType | None = None
 
 
 def reset_llm_singletons() -> None:
     """Clear cached LLM clients (tests, benchmarks, alternate configs)."""
-    global _llm, _llm_for_tools
+    global _llm, _llm_for_classification, _llm_for_tools
     _llm = None
+    _llm_for_classification = None
     _llm_for_tools = None
 
 
-def _create_llm_client(model_type: str) -> _LLMClientType:
-    settings = LLMSettings.from_env()
+def _get_cli_provider_registration(provider: str) -> CLIProviderRegistration | None:
+    """Local import avoids package import cycle (llm_cli __init__ → runner → llm_client)."""
+    from app.integrations.llm_cli.registry import get_cli_provider_registration
+
+    return get_cli_provider_registration(provider)
+
+
+# Three-tier model selection: highest-cost reasoning > mid-tier classification > cheapest toolcall.
+ModelType = Literal["reasoning", "classification", "toolcall"]
+
+
+def _select_model(settings: Any, provider_prefix: str, model_type: ModelType) -> str:
+    """Look up the per-provider model field for the requested tier.
+
+    Reads ``{provider_prefix}_{model_type}_model`` off the validated
+    :class:`LLMSettings` instance. Centralises the dispatch so adding a new
+    tier (e.g. the ``classification`` tier added for the interactive-shell
+    intent classifier) only requires extending the settings model rather
+    than touching every per-provider branch in :func:`_create_llm_client`.
+    """
+    attr = f"{provider_prefix}_{model_type}_model"
+    return str(getattr(settings, attr))
+
+
+def _create_llm_client(model_type: ModelType) -> _LLMClientType:
+    try:
+        settings = LLMSettings.from_env()
+    except ValidationError as exc:
+        errors = exc.errors()
+        if len(errors) == 1:
+            msg = re.sub(r"^[Vv]alue error,\s*", "", errors[0].get("msg", "")).strip()
+            raise RuntimeError(msg or str(exc)) from exc
+        raise RuntimeError(str(exc)) from exc
     provider = settings.provider
     if provider == "openai":
         config = OPENAI_LLM_CONFIG
-        model = (
-            settings.openai_reasoning_model
-            if model_type == "reasoning"
-            else settings.openai_toolcall_model
+        return OpenAILLMClient(
+            model=_select_model(settings, "openai", model_type),
+            max_tokens=config.max_tokens,
         )
-        return OpenAILLMClient(model=model, max_tokens=config.max_tokens)
     elif provider == "openrouter":
         from app.config import OPENROUTER_LLM_CONFIG
 
         config = OPENROUTER_LLM_CONFIG
-        model = (
-            settings.openrouter_reasoning_model
-            if model_type == "reasoning"
-            else settings.openrouter_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "openrouter", model_type),
             max_tokens=config.max_tokens,
             base_url=OPENROUTER_BASE_URL,
             api_key_env="OPENROUTER_API_KEY",
+        )
+    elif provider == "requesty":
+        from app.config import REQUESTY_BASE_URL, REQUESTY_LLM_CONFIG
+
+        config = REQUESTY_LLM_CONFIG
+        return OpenAILLMClient(
+            model=_select_model(settings, "requesty", model_type),
+            max_tokens=config.max_tokens,
+            base_url=REQUESTY_BASE_URL,
+            api_key_env="REQUESTY_API_KEY",
+            default_headers={"X-Title": "OpenSRE"},
         )
     elif provider == "gemini":
         from app.config import GEMINI_LLM_CONFIG
 
         config = GEMINI_LLM_CONFIG
-        model = (
-            settings.gemini_reasoning_model
-            if model_type == "reasoning"
-            else settings.gemini_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "gemini", model_type),
             max_tokens=config.max_tokens,
             base_url=GEMINI_BASE_URL,
             api_key_env="GEMINI_API_KEY",
@@ -508,13 +1077,8 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import NVIDIA_LLM_CONFIG
 
         config = NVIDIA_LLM_CONFIG
-        model = (
-            settings.nvidia_reasoning_model
-            if model_type == "reasoning"
-            else settings.nvidia_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "nvidia", model_type),
             max_tokens=config.max_tokens,
             base_url=NVIDIA_BASE_URL,
             api_key_env="NVIDIA_API_KEY",
@@ -523,13 +1087,8 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import MINIMAX_LLM_CONFIG
 
         config = MINIMAX_LLM_CONFIG
-        model = (
-            settings.minimax_reasoning_model
-            if model_type == "reasoning"
-            else settings.minimax_toolcall_model
-        )
         return OpenAILLMClient(
-            model=model,
+            model=_select_model(settings, "minimax", model_type),
             max_tokens=config.max_tokens,
             base_url=MINIMAX_BASE_URL,
             api_key_env="MINIMAX_API_KEY",
@@ -538,6 +1097,7 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
     elif provider == "ollama":
         from app.config import OLLAMA_LLM_CONFIG
 
+        # Ollama exposes a single local model regardless of tier.
         config = OLLAMA_LLM_CONFIG
         host = settings.ollama_host.rstrip("/")
         return OpenAILLMClient(
@@ -551,40 +1111,34 @@ def _create_llm_client(model_type: str) -> _LLMClientType:
         from app.config import BEDROCK_LLM_CONFIG
 
         config = BEDROCK_LLM_CONFIG
-        model = (
-            settings.bedrock_reasoning_model
-            if model_type == "reasoning"
-            else settings.bedrock_toolcall_model
+        return BedrockLLMClient(
+            model=_select_model(settings, "bedrock", model_type),
+            max_tokens=config.max_tokens,
         )
-        return BedrockLLMClient(model=model, max_tokens=config.max_tokens)
-    elif provider == "codex":
+    elif (cli_reg := _get_cli_provider_registration(provider)) is not None:
         from app.config import DEFAULT_MAX_TOKENS
-        from app.integrations.llm_cli.codex import CodexAdapter
         from app.integrations.llm_cli.runner import CLIBackedLLMClient
 
-        # Empty CODEX_MODEL means "use Codex CLI's configured default/current model" (omit -m).
-        model_name = os.getenv("CODEX_MODEL", "").strip() or None
+        model_name = os.getenv(cli_reg.model_env_key, "").strip() or None
         return CLIBackedLLMClient(
-            CodexAdapter(),
+            cli_reg.adapter_factory(),
             model=model_name,
             max_tokens=DEFAULT_MAX_TOKENS,
             model_type=model_type,
         )
     else:
         config = ANTHROPIC_LLM_CONFIG
-        model = (
-            settings.anthropic_reasoning_model
-            if model_type == "reasoning"
-            else settings.anthropic_toolcall_model
+        return LLMClient(
+            model=_select_model(settings, "anthropic", model_type),
+            max_tokens=config.max_tokens,
         )
-        return LLMClient(model=model, max_tokens=config.max_tokens)
 
 
 def get_llm_for_reasoning() -> _LLMClientType:
     """
     Get or create the LLM client singleton for complex reasoning tasks.
 
-    Uses the full-capability model (e.g., Claude Opus, GPT-4o) for:
+    Uses the full-capability model (e.g., Claude Opus, GPT-5) for:
     - Root cause diagnosis and multi-step analysis
     - Evidence categorization and claim validation
 
@@ -597,12 +1151,34 @@ def get_llm_for_reasoning() -> _LLMClientType:
     return _llm
 
 
+def get_llm_for_classification() -> _LLMClientType:
+    """
+    Get or create the LLM client singleton for the mid-tier classification tier.
+
+    Uses a Sonnet-class model (Claude Sonnet for Anthropic/Bedrock/Requesty,
+    Gemini Flash for Gemini, GPT-5 mini for OpenAI). Heavier and slower than
+    the toolcall tier but markedly more capable on tasks that need real
+    instruction-following — e.g. interactive-shell intent classification —
+    while still being substantially cheaper than the reasoning tier.
+
+    Override the per-provider model via ``<PROVIDER>_CLASSIFICATION_MODEL``
+    (e.g. ``ANTHROPIC_CLASSIFICATION_MODEL=claude-sonnet-4-6``).
+    """
+    global _llm_for_classification
+    if _llm_for_classification is None:
+        _llm_for_classification = _create_llm_client(model_type="classification")
+    return _llm_for_classification
+
+
 def get_llm_for_tools() -> _LLMClientType:
     """
     Get or create a lightweight LLM client for tool selection and action planning.
 
-    Uses toolcall models (Claude Haiku for Anthropic, GPT-4o mini for OpenAI)
+    Uses toolcall models (Claude Haiku for Anthropic, GPT-5 mini for OpenAI)
     for lower cost and faster inference on simple routing decisions.
+
+    For tasks that need stronger instruction-following than Haiku-tier models
+    can reliably provide, use :func:`get_llm_for_classification` instead.
     """
     global _llm_for_tools
     if _llm_for_tools is None:
@@ -622,6 +1198,7 @@ def parse_root_cause(response: str) -> RootCauseResult:
     validated_claims: list[str] = []
     non_validated_claims: list[str] = []
     causal_chain: list[str] = []
+    remediation_steps: list[str] = []
 
     if "ROOT_CAUSE_CATEGORY:" in response:
         parts = response.split("ROOT_CAUSE_CATEGORY:", 1)
@@ -629,7 +1206,7 @@ def parse_root_cause(response: str) -> RootCauseResult:
             after = parts[1]
             for line in after.split("\n"):
                 candidate = line.strip().lower()
-                if candidate and candidate in _VALID_ROOT_CAUSE_CATEGORIES:
+                if candidate and candidate in VALID_ROOT_CAUSE_CATEGORIES:
                     root_cause_category = candidate
                     break
 
@@ -643,6 +1220,7 @@ def parse_root_cause(response: str) -> RootCauseResult:
                 "VALIDATED_CLAIMS:",
                 "NON_VALIDATED_CLAIMS:",
                 "CAUSAL_CHAIN:",
+                "REMEDIATION_STEPS:",
             ):
                 if delimiter in after:
                     root_cause = after.split(delimiter, 1)[0].strip()
@@ -653,10 +1231,14 @@ def parse_root_cause(response: str) -> RootCauseResult:
             # Extract validated claims
             if "VALIDATED_CLAIMS:" in after:
                 validated_section = after.split("VALIDATED_CLAIMS:", 1)[1]
-                if "NON_VALIDATED_CLAIMS:" in validated_section:
-                    validated_text = validated_section.split("NON_VALIDATED_CLAIMS:", 1)[0]
-                elif "CAUSAL_CHAIN:" in validated_section:
-                    validated_text = validated_section.split("CAUSAL_CHAIN:", 1)[0]
+                for delimiter in (
+                    "NON_VALIDATED_CLAIMS:",
+                    "CAUSAL_CHAIN:",
+                    "REMEDIATION_STEPS:",
+                ):
+                    if delimiter in validated_section:
+                        validated_text = validated_section.split(delimiter, 1)[0]
+                        break
                 else:
                     validated_text = validated_section
 
@@ -668,13 +1250,18 @@ def parse_root_cause(response: str) -> RootCauseResult:
                         and not line.startswith("CAUSAL_CHAIN")
                         and not line.startswith("CONFIDENCE")
                         and not line.startswith("ROOT_CAUSE")
+                        and not line.startswith("REMEDIATION_STEPS")
                     ):
                         validated_claims.append(line)
 
             # Extract non-validated claims
             if "NON_VALIDATED_CLAIMS:" in after:
                 non_validated_section = after.split("NON_VALIDATED_CLAIMS:", 1)[1]
-                for delimiter in ("ALTERNATIVE_HYPOTHESES_CONSIDERED:", "CAUSAL_CHAIN:"):
+                for delimiter in (
+                    "ALTERNATIVE_HYPOTHESES_CONSIDERED:",
+                    "CAUSAL_CHAIN:",
+                    "REMEDIATION_STEPS:",
+                ):
                     if delimiter in non_validated_section:
                         non_validated_text = non_validated_section.split(delimiter, 1)[0]
                         break
@@ -687,12 +1274,15 @@ def parse_root_cause(response: str) -> RootCauseResult:
                         line
                         and not line.startswith("CAUSAL_CHAIN")
                         and not line.startswith("ALTERNATIVE")
+                        and not line.startswith("REMEDIATION_STEPS")
                     ):
                         non_validated_claims.append(line)
 
             # Extract causal chain
             if "CAUSAL_CHAIN:" in after:
                 causal_section = after.split("CAUSAL_CHAIN:", 1)[1]
+                if "REMEDIATION_STEPS:" in causal_section:
+                    causal_section = causal_section.split("REMEDIATION_STEPS:", 1)[0]
                 causal_text = causal_section
 
                 for line in causal_text.strip().split("\n"):
@@ -700,10 +1290,31 @@ def parse_root_cause(response: str) -> RootCauseResult:
                     if line and not line.startswith("ALTERNATIVE"):
                         causal_chain.append(line)
 
+            if "REMEDIATION_STEPS:" in after:
+                rem_section = after.split("REMEDIATION_STEPS:", 1)[1]
+                for line in rem_section.strip().split("\n"):
+                    line = line.strip().lstrip("*-•( ").strip()
+                    if not line or line.startswith("("):
+                        continue
+                    if any(
+                        line.startswith(h)
+                        for h in (
+                            "ROOT_CAUSE",
+                            "VALIDATED",
+                            "NON_VALIDATED",
+                            "CAUSAL",
+                            "ALTERNATIVE",
+                            "REMEDIATION_STEPS",
+                        )
+                    ):
+                        break
+                    remediation_steps.append(line)
+
     return RootCauseResult(
         root_cause=root_cause,
         root_cause_category=root_cause_category,
         validated_claims=validated_claims,
         non_validated_claims=non_validated_claims,
         causal_chain=causal_chain,
+        remediation_steps=remediation_steps,
     )

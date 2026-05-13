@@ -43,10 +43,15 @@ def test_slack_message_is_unmasked_before_delivery() -> None:
     with (
         patch.object(pub_node, "build_report_context", return_value=MagicMock()),
         patch.object(pub_node, "format_slack_message", return_value=masked_message),
+        patch.object(pub_node, "format_telegram_message", return_value="tg"),
         patch.object(pub_node, "build_slack_blocks", return_value=[]),
         patch.object(pub_node, "render_report"),
         patch.object(pub_node, "open_in_editor"),
-        patch.object(pub_node, "send_ingest", return_value=None),
+        patch.object(
+            pub_node,
+            "create_investigation_and_attach_url",
+            return_value=("inv-123", "https://test/inv-123"),
+        ),
         patch("app.utils.slack_delivery.send_slack_report", return_value=(False, None)),
         patch("app.utils.slack_delivery.build_action_blocks", return_value=[]),
     ):
@@ -68,10 +73,15 @@ def test_empty_masking_map_is_passthrough() -> None:
     with (
         patch.object(pub_node, "build_report_context", return_value=MagicMock()),
         patch.object(pub_node, "format_slack_message", return_value=message_without_placeholders),
+        patch.object(pub_node, "format_telegram_message", return_value="tg"),
         patch.object(pub_node, "build_slack_blocks", return_value=[]),
         patch.object(pub_node, "render_report"),
         patch.object(pub_node, "open_in_editor"),
-        patch.object(pub_node, "send_ingest", return_value=None),
+        patch.object(
+            pub_node,
+            "create_investigation_and_attach_url",
+            return_value=("inv-123", "https://test/inv-123"),
+        ),
         patch("app.utils.slack_delivery.send_slack_report", return_value=(False, None)),
         patch("app.utils.slack_delivery.build_action_blocks", return_value=[]),
     ):

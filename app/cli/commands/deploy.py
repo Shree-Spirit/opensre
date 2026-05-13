@@ -8,14 +8,14 @@ from typing import Any
 import click
 
 from app.analytics.cli import (
-    capture_cli_invoked,
     capture_deploy_completed,
     capture_deploy_failed,
     capture_deploy_started,
 )
-from app.cli.context import is_json_output, is_yes
-from app.cli.errors import OpenSREError
-from app.cli.langsmith_deploy import (
+from app.cli.interactive_shell.ui.theme import BRAND, DIM, ERROR, HIGHLIGHT, WARNING
+from app.cli.support.context import is_json_output, is_yes
+from app.cli.support.errors import OpenSREError
+from app.deployment.methods.langsmith import (
     extract_deployment_url,
     is_langgraph_cli_installed,
     persist_langsmith_env,
@@ -24,18 +24,18 @@ from app.cli.langsmith_deploy import (
     run_langsmith_deploy,
     validate_langsmith_api_key,
 )
-from app.deployment.ec2_config import load_remote_outputs
-from app.deployment.health import poll_deployment_health
+from app.deployment.operations.ec2_config import load_remote_outputs
+from app.deployment.operations.health import poll_deployment_health
 
 
 def _deploy_style(questionary: Any) -> Any:
     return questionary.Style(
         [
-            ("qmark", "fg:cyan bold"),
+            ("qmark", f"fg:{BRAND} bold"),
             ("question", "bold"),
-            ("answer", "fg:cyan bold"),
-            ("pointer", "fg:cyan bold"),
-            ("highlighted", "fg:cyan bold"),
+            ("answer", f"fg:{BRAND} bold"),
+            ("pointer", f"fg:{BRAND} bold"),
+            ("highlighted", f"fg:{BRAND} bold"),
         ]
     )
 
@@ -49,7 +49,7 @@ def _get_deployment_status() -> dict[str, str]:
             "instance_id": outputs.get("InstanceId", ""),
             "port": outputs.get("ServerPort", "8080"),
         }
-    except (FileNotFoundError, Exception):  # noqa: BLE001
+    except (FileNotFoundError, Exception):
         return {}
 
 
@@ -101,10 +101,10 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
     if status.get("ip"):
         status_line = f"EC2 running at [bold]{status['ip']}:{status['port']}[/bold]"
     else:
-        status_line = "[dim]no active deployment[/dim]"
+        status_line = f"[{DIM}]no active deployment[/]"
 
     console.print()
-    console.print(f"  [bold cyan]Deploy[/bold cyan]  {status_line}")
+    console.print(f"  [bold {BRAND}]Deploy[/]  {status_line}")
     console.print()
 
     choices: list[Any] = []
@@ -156,7 +156,7 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
             default=True,
             style=style,
         ).ask():
-            console.print("  [dim]Cancelled.[/dim]")
+            console.print(f"  [{DIM}]Cancelled.[/]")
             return
 
         ctx.invoke(deploy_ec2, down=False, branch=branch)
@@ -170,7 +170,7 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
         # 2. LangGraph CLI check
         ok, msg = is_langgraph_cli_installed()
         if not ok:
-            console.print(f"[red]{msg}[/red]")
+            console.print(f"[{ERROR}]{msg}[/]")
             return
 
         # 3. API key resolve
@@ -183,7 +183,7 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
         # 4. Validate API key
         valid, msg = validate_langsmith_api_key(api_key)
         if not valid:
-            console.print(f"[red]{msg}[/red]")
+            console.print(f"[{ERROR}]{msg}[/]")
             return
 
         # 5. Deployment name
@@ -194,17 +194,16 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
             default=True,
             style=style,
         ).ask():
-            console.print("  [dim]Cancelled.[/dim]")
+            console.print(f"  [{DIM}]Cancelled.[/]")
             return
 
         # 6. Persist to .env
         persist_langsmith_env(api_key, deployment_name)
 
-        capture_cli_invoked()
         capture_deploy_started(target="langsmith", dry_run=False)
 
         # 7. Deploy
-        console.print("[cyan]Deploying to LangSmith...[/cyan]")
+        console.print(f"[{BRAND}]Deploying to LangSmith...[/]")
         code, output = run_langsmith_deploy(
             api_key=api_key,
             deployment_name=deployment_name,
@@ -218,12 +217,12 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
             capture_deploy_completed(target="langsmith", dry_run=False)
             url = extract_deployment_url(output)
             if url:
-                console.print(f"[green]Deployment URL:[/green] {url}")
+                console.print(f"[{HIGHLIGHT}]Deployment URL:[/] {url}")
             else:
-                console.print("[yellow]Deployment succeeded but no URL found[/yellow]")
+                console.print(f"[{WARNING}]Deployment succeeded but no URL found[/]")
         else:
             capture_deploy_failed(target="langsmith", dry_run=False)
-            console.print("[red]Deployment failed[/red]")
+            console.print(f"[{ERROR}]Deployment failed[/]")
 
         return
 
@@ -233,7 +232,7 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
             default=False,
             style=style,
         ).ask():
-            console.print("  [dim]Cancelled.[/dim]")
+            console.print(f"  [{DIM}]Cancelled.[/]")
             return
         ctx.invoke(deploy_ec2, down=True, branch="main")  # branch unused when down=True
         return
@@ -248,7 +247,7 @@ def _run_deploy_interactive(ctx: click.Context) -> None:
             default=False,
             style=style,
         ).ask():
-            console.print("  [dim]Cancelled.[/dim]")
+            console.print(f"  [{DIM}]Cancelled.[/]")
             return
 
         _redeploy_ec2(ctx, branch=branch, console=console)
@@ -268,13 +267,44 @@ def _check_deploy_health(status: dict[str, str], console: Any) -> None:
             request_timeout_seconds=5.0,
         )
         console.print(
-            f"  [green]Healthy[/green]  endpoint={health.url} "
+            f"  [{HIGHLIGHT}]Healthy[/]  endpoint={health.url} "
             f"attempts={health.attempts} elapsed={health.elapsed_seconds:.1f}s"
         )
     except TimeoutError:
-        console.print(f"  [red]Timeout[/red]  could not reach {ip}:{port}")
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"  [red]Unhealthy[/red]  {exc}")
+        console.print(f"  [{ERROR}]Timeout[/]  could not reach {ip}:{port}")
+    except Exception as exc:
+        console.print(f"  [{ERROR}]Unhealthy[/]  {exc}")
+
+
+def _ec2_deploy_not_bundled_error() -> OpenSREError:
+    """Structured error for ``opensre deploy ec2`` when the deploy SDK isn't shipped.
+
+    The EC2 deployment SDK lives under ``tests/deployment/ec2/`` and is excluded
+    from PyInstaller bundles by ``packaging/opensre.spec``'s ``_is_runtime_submodule``
+    filter, so ``opensre deploy ec2`` (with or without ``--down``) cannot run from
+    a packaged binary.
+    """
+    return OpenSREError(
+        "EC2 deployment is not available in this build.",
+        suggestion=(
+            "Pre-built binaries do not bundle the EC2 deployment SDK under "
+            "'tests/deployment/ec2/'. Install from source (`git clone "
+            "https://github.com/Tracer-Cloud/opensre && pip install -e .`) "
+            "and re-run 'opensre deploy ec2'."
+        ),
+    )
+
+
+def _aws_credentials_error(action: str) -> OpenSREError:
+    return OpenSREError(
+        "AWS credentials not found.",
+        suggestion=(
+            f"Configure AWS credentials before {action}:\n"
+            "  1. Run 'aws configure' to set up ~/.aws/credentials\n"
+            "  2. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY env vars\n"
+            "  3. Attach an IAM role if running on EC2"
+        ),
+    )
 
 
 def _build_remote_url(outputs: Mapping[str, object]) -> str | None:
@@ -285,7 +315,11 @@ def _build_remote_url(outputs: Mapping[str, object]) -> str | None:
     return f"http://{ip}:{port}"
 
 
-@click.group(name="deploy", invoke_without_command=True)
+@click.group(
+    name="deploy",
+    context_settings={"help_option_names": ["-h", "--help"]},
+    invoke_without_command=True,
+)
 @click.pass_context
 def deploy(ctx: click.Context) -> None:
     """Deploy OpenSRE to a cloud environment."""
@@ -319,16 +353,39 @@ def deploy_ec2(down: bool, branch: str) -> None:
       opensre deploy ec2 --down          # tear it down
       opensre deploy ec2 --branch main   # deploy from a specific branch
     """
-    if down:
-        from tests.deployment.ec2.infrastructure_sdk.destroy_remote import destroy
+    from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
-        destroy()
+    if down:
+        try:
+            from tests.deployment.ec2.infrastructure_sdk.destroy_remote import destroy
+        except ModuleNotFoundError as exc:
+            # ``packaging/opensre.spec`` excludes the ``tests`` tree from
+            # PyInstaller bundles. Surface a clean OpenSREError instead of a
+            # raw ``ModuleNotFoundError`` traceback. Narrow on ``exc.name``
+            # so unrelated transitive missing-deps still bubble up.
+            if exc.name is None or not exc.name.startswith("tests.deployment.ec2"):
+                raise
+            raise _ec2_deploy_not_bundled_error() from exc
+
+        try:
+            destroy()
+        except (NoCredentialsError, PartialCredentialsError) as exc:
+            raise _aws_credentials_error("tearing down an EC2 deployment") from exc
         return
 
     from app.cli.commands.remote_health import run_remote_health_check
-    from tests.deployment.ec2.infrastructure_sdk.deploy_remote import deploy as run_deploy
 
-    outputs = run_deploy(branch=branch)
+    try:
+        from tests.deployment.ec2.infrastructure_sdk.deploy_remote import deploy as run_deploy
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not exc.name.startswith("tests.deployment.ec2"):
+            raise
+        raise _ec2_deploy_not_bundled_error() from exc
+
+    try:
+        outputs = run_deploy(branch=branch)
+    except (NoCredentialsError, PartialCredentialsError) as exc:
+        raise _aws_credentials_error("deploying to EC2") from exc
     _persist_remote_url(outputs)
 
     remote_url = _build_remote_url(outputs)
@@ -353,9 +410,8 @@ def deploy_railway(
     yes: bool,
 ) -> None:
     """Deploy OpenSRE to Railway."""
-    from app.cli.deploy import run_deploy
+    from app.deployment.methods.railway import run_deploy
 
-    capture_cli_invoked()
     capture_deploy_started(target="railway", dry_run=dry_run)
     exit_code = run_deploy(
         target="railway",

@@ -44,6 +44,106 @@ class TestEKSMappersRegistered:
         assert "get_eks_pod_logs" in EVIDENCE_MAPPERS
 
 
+class TestEC2RDSMappersPreserveSummary:
+    """The two non-K8s topology mappers must forward the ``summary`` block.
+
+    Tools precompute by_tier_counts / healthy_ratio_pct / etc. specifically so
+    the agent can quote them without iterating arrays. If the mapper drops
+    ``summary`` (as the initial draft did), the entire agent-friendly
+    enrichment never reaches the evidence store.
+    """
+
+    def test_ec2_instances_by_tag_registered(self) -> None:
+        assert "ec2_instances_by_tag" in EVIDENCE_MAPPERS
+
+    def test_get_elb_target_health_registered(self) -> None:
+        assert "get_elb_target_health" in EVIDENCE_MAPPERS
+
+    def test_ec2_summary_reaches_evidence(self) -> None:
+        mapper = EVIDENCE_MAPPERS["ec2_instances_by_tag"]
+        mapped = mapper(
+            {
+                "source": "ec2",
+                "available": True,
+                "instances": [{"instance_id": "i-1", "tier": "web"}],
+                "by_tier": {"web": ["i-1"]},
+                "tiers_detected": ["web"],
+                "total_instances": 1,
+                "summary": {
+                    "by_tier_counts": {"web": 1},
+                    "total_active": 1,
+                    "primary_tier": "web",
+                    "vpcs_in_scope": ["vpc-1"],
+                    "azs_in_scope": ["us-east-1a"],
+                },
+            }
+        )
+        assert mapped["ec2_instances_summary"]["by_tier_counts"] == {"web": 1}
+        assert mapped["ec2_instances_summary"]["primary_tier"] == "web"
+
+    def test_elb_summary_reaches_evidence(self) -> None:
+        mapper = EVIDENCE_MAPPERS["get_elb_target_health"]
+        mapped = mapper(
+            {
+                "source": "ec2",
+                "available": True,
+                "target_groups": [{"TargetGroupArn": "tg-1"}],
+                "healthy_targets": [{"instance_id": "i-1", "state": "healthy"}],
+                "unhealthy_targets": [],
+                "instance_ids": ["i-1"],
+                "summary": {
+                    "total_targets": 1,
+                    "healthy_count": 1,
+                    "unhealthy_count": 0,
+                    "healthy_ratio_pct": 100.0,
+                    "unhealthy_states": [],
+                    "target_group_count": 1,
+                },
+            }
+        )
+        assert mapped["elb_target_health_summary"]["healthy_ratio_pct"] == 100.0
+        assert mapped["elb_target_health_summary"]["target_group_count"] == 1
+
+    def test_elb_api_errors_reach_evidence(self) -> None:
+        """Partial-coverage failures must surface to the agent. Without
+        ``elb_api_errors`` the agent would read healthy_ratio_pct=100 from
+        the only successful TG and miss that other TGs were never queried."""
+        mapper = EVIDENCE_MAPPERS["get_elb_target_health"]
+        mapped = mapper(
+            {
+                "source": "ec2",
+                "available": False,
+                "target_groups": [
+                    {"TargetGroupArn": "tg-web"},
+                    {"TargetGroupArn": "tg-worker"},
+                ],
+                "healthy_targets": [{"instance_id": "i-w1", "state": "healthy"}],
+                "unhealthy_targets": [],
+                "instance_ids": ["i-w1"],
+                "summary": {
+                    "total_targets": 1,
+                    "healthy_count": 1,
+                    "unhealthy_count": 0,
+                    "healthy_ratio_pct": 100.0,
+                    "unhealthy_states": [],
+                    "target_group_count": 2,
+                },
+                "api_errors": [{"target_group_arn": "tg-worker", "error": "AccessDenied"}],
+            }
+        )
+        assert mapped["elb_api_errors"] == [
+            {"target_group_arn": "tg-worker", "error": "AccessDenied"}
+        ]
+
+    def test_summary_absent_does_not_crash_mapper(self) -> None:
+        """Older or partial tool outputs without a summary block must still
+        flow through — the mapper degrades to an empty dict rather than KeyError."""
+        ec2 = EVIDENCE_MAPPERS["ec2_instances_by_tag"]({"instances": []})
+        assert ec2["ec2_instances_summary"] == {}
+        elb = EVIDENCE_MAPPERS["get_elb_target_health"]({"target_groups": []})
+        assert elb["elb_target_health_summary"] == {}
+
+
 class TestListEKSPodsMapper:
     """list_eks_pods → eks_pods / eks_failing_pods / eks_high_restart_pods / eks_total_pods."""
 
@@ -77,6 +177,61 @@ class TestListEKSPodsMapper:
         assert evidence["eks_failing_pods"] == []
         assert evidence["eks_high_restart_pods"] == []
         assert evidence["eks_total_pods"] == 0
+
+
+class TestOpenClawConversationContextMerge:
+    """OpenClaw mappers must accumulate ``openclaw_conversation_context`` across actions."""
+
+    def test_search_then_call_openclaw_tool_appends_tool_text(self) -> None:
+        after_search = merge_evidence(
+            {},
+            {
+                "search_openclaw_conversations": _result(
+                    "search_openclaw_conversations",
+                    {
+                        "conversations": [{"title": "inc-42", "lastMessage": "prior context"}],
+                        "text": "",
+                    },
+                )
+            },
+        )
+        assert "prior context" in str(after_search.get("openclaw_conversation_context", ""))
+
+        merged = merge_evidence(
+            after_search,
+            {
+                "call_openclaw_tool": _result(
+                    "call_openclaw_tool",
+                    {"tool": "events_list", "text": "bridge tool output"},
+                )
+            },
+        )
+        ctx = str(merged.get("openclaw_conversation_context", ""))
+        assert "prior context" in ctx
+        assert "bridge tool output" in ctx
+
+    def test_get_openclaw_conversation_appends_to_existing_context(self) -> None:
+        prior = merge_evidence(
+            {},
+            {
+                "search_openclaw_conversations": _result(
+                    "search_openclaw_conversations",
+                    {"conversations": [], "text": "search snippet"},
+                )
+            },
+        )
+        merged = merge_evidence(
+            prior,
+            {
+                "get_openclaw_conversation": _result(
+                    "get_openclaw_conversation",
+                    {"structured_content": {}, "text": "full thread"},
+                )
+            },
+        )
+        ctx = str(merged.get("openclaw_conversation_context", ""))
+        assert "search snippet" in ctx
+        assert "full thread" in ctx
 
 
 class TestGetEKSEventsMapper:

@@ -27,6 +27,54 @@ def test_deploy_ec2_health_check_failure_is_non_fatal() -> None:
     assert "Deployment provisioned. Retry with: opensre remote health" in result.output
 
 
+def test_deploy_ec2_missing_credentials_surfaces_friendly_error() -> None:
+    from botocore.exceptions import NoCredentialsError
+
+    runner = CliRunner()
+    with patch(
+        "tests.deployment.ec2.infrastructure_sdk.deploy_remote.deploy",
+        side_effect=NoCredentialsError(),
+    ):
+        result = runner.invoke(cli, ["deploy", "ec2"])
+
+    assert result.exit_code != 0
+    assert "AWS credentials not found." in result.output
+    assert "Configure AWS credentials before deploying to EC2" in result.output
+
+
+def test_deploy_ec2_partial_credentials_surfaces_friendly_error() -> None:
+    from botocore.exceptions import PartialCredentialsError
+
+    runner = CliRunner()
+    with patch(
+        "tests.deployment.ec2.infrastructure_sdk.deploy_remote.deploy",
+        side_effect=PartialCredentialsError(
+            provider="env",
+            cred_var="AWS_SECRET_ACCESS_KEY",
+        ),
+    ):
+        result = runner.invoke(cli, ["deploy", "ec2"])
+
+    assert result.exit_code != 0
+    assert "AWS credentials not found." in result.output
+    assert "Configure AWS credentials before deploying to EC2" in result.output
+
+
+def test_deploy_ec2_down_missing_credentials_surfaces_friendly_error() -> None:
+    from botocore.exceptions import NoCredentialsError
+
+    runner = CliRunner()
+    with patch(
+        "tests.deployment.ec2.infrastructure_sdk.destroy_remote.destroy",
+        side_effect=NoCredentialsError(),
+    ):
+        result = runner.invoke(cli, ["deploy", "ec2", "--down"])
+
+    assert result.exit_code != 0
+    assert "AWS credentials not found." in result.output
+    assert "Configure AWS credentials before tearing down an EC2 deployment" in result.output
+
+
 def test_deploy_langsmith_success_prints_url() -> None:
     runner = CliRunner()
 
@@ -156,7 +204,7 @@ def test_deploy_langsmith_missing_key_fails() -> None:
 
 import pytest
 
-from app.cli.deploy import (
+from app.deployment.methods.railway import (
     _extract_railway_url,
     deploy_to_railway,
     get_railway_auth_status,
@@ -169,23 +217,23 @@ class TestIsRailwayCliInstalled:
     """Tests for is_railway_cli_installed function."""
 
     def test_returns_true_when_cli_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def mock_run(*args, **kwargs):  # noqa: ARG001
+        def mock_run(*args, **kwargs):
             class Result:
                 returncode = 0
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run)
         assert is_railway_cli_installed() is True
 
     def test_returns_false_when_cli_not_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def mock_run(*args, **kwargs):  # noqa: ARG001
+        def mock_run(*args, **kwargs):
             class Result:
                 returncode = 127
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run)
         assert is_railway_cli_installed() is False
 
 
@@ -193,7 +241,7 @@ class TestGetRailwayAuthStatus:
     """Tests for get_railway_auth_status function."""
 
     def test_authenticated_when_whoami_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def mock_run(*args, **kwargs):  # noqa: ARG001
+        def mock_run(*args, **kwargs):
             class Result:
                 returncode = 0
                 stdout = "user@example.com"
@@ -201,13 +249,13 @@ class TestGetRailwayAuthStatus:
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run)
         result = get_railway_auth_status()
         assert result["authenticated"] is True
         assert result["detail"] == "user@example.com"
 
     def test_not_authenticated_when_whoami_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def mock_run(*args, **kwargs):  # noqa: ARG001
+        def mock_run(*args, **kwargs):
             class Result:
                 returncode = 1
                 stdout = ""
@@ -215,7 +263,7 @@ class TestGetRailwayAuthStatus:
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run)
         result = get_railway_auth_status()
         assert result["authenticated"] is False
         detail = result["detail"]
@@ -246,16 +294,18 @@ class TestDeployToRailway:
     """Tests for deploy_to_railway function."""
 
     def test_returns_error_when_cli_not_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: False)
+        monkeypatch.setattr(
+            "app.deployment.methods.railway.is_railway_cli_installed", lambda: False
+        )
         result = deploy_to_railway()
         assert result["success"] is False
         error = result.get("error")
         assert isinstance(error, str) and "not found" in error.lower()
 
     def test_returns_error_when_not_authenticated(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: True)
+        monkeypatch.setattr("app.deployment.methods.railway.is_railway_cli_installed", lambda: True)
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: {"authenticated": False, "detail": "Not logged in"},
         )
         result = deploy_to_railway()
@@ -270,7 +320,7 @@ class TestDeployToRailway:
         assert "dry-run" in result["logs"][0].lower()
 
     def test_failed_deploy_includes_database_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def mock_run_command(cmd: list[str], **kwargs: object) -> object:  # noqa: ARG001
+        def mock_run_command(cmd: list[str], **kwargs: object) -> object:
             class Result:
                 returncode = 1
                 stdout = ""
@@ -278,7 +328,7 @@ class TestDeployToRailway:
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run_command)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run_command)
 
         result = deploy_to_railway(wait_for_health=False, auth_detail="user@example.com")
 
@@ -289,15 +339,15 @@ class TestDeployToRailway:
         assert "REDIS_URI" in logs
 
     def test_successful_deploy(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: True)
+        monkeypatch.setattr("app.deployment.methods.railway.is_railway_cli_installed", lambda: True)
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: {"authenticated": True, "detail": "user@example.com"},
         )
 
         commands_run: list[list[str]] = []
 
-        def mock_run_command(cmd: list[str], **kwargs: object) -> object:  # noqa: ARG001
+        def mock_run_command(cmd: list[str], **kwargs: object) -> object:
             commands_run.append(cmd)
 
             class Result:
@@ -307,7 +357,7 @@ class TestDeployToRailway:
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run_command)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run_command)
 
         # Mock httpx.get for health check
         class MockResponse:
@@ -322,13 +372,13 @@ class TestDeployToRailway:
         assert result["url"] == "https://myapp.up.railway.app"
 
     def test_health_check_uses_ok_endpoint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: True)
+        monkeypatch.setattr("app.deployment.methods.railway.is_railway_cli_installed", lambda: True)
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: {"authenticated": True, "detail": "user@example.com"},
         )
 
-        def mock_run_command(cmd: list[str], **kwargs: object) -> object:  # noqa: ARG001
+        def mock_run_command(cmd: list[str], **kwargs: object) -> object:
             class Result:
                 returncode = 0
                 stdout = "https://myapp.up.railway.app"
@@ -345,7 +395,7 @@ class TestDeployToRailway:
             requested_urls.append(url)
             return MockResponse()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run_command)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run_command)
         monkeypatch.setattr("httpx.get", mock_httpx_get)
         monkeypatch.setattr("time.sleep", lambda _x: None)
 
@@ -360,7 +410,7 @@ class TestDeployToRailway:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        def mock_run_command(cmd: list[str], **kwargs: object) -> object:  # noqa: ARG001
+        def mock_run_command(cmd: list[str], **kwargs: object) -> object:
             class Result:
                 returncode = 0
                 stdout = "https://myapp.up.railway.app"
@@ -371,7 +421,7 @@ class TestDeployToRailway:
         class MockResponse:
             status_code = 503
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run_command)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run_command)
         monkeypatch.setattr("httpx.get", lambda *_args, **_kwargs: MockResponse())
         monkeypatch.setattr("time.sleep", lambda _x: None)
 
@@ -393,15 +443,15 @@ class TestDeployToRailway:
         assert "REDIS_URI" in logs
 
     def test_domain_fallback_adds_https_scheme(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: True)
+        monkeypatch.setattr("app.deployment.methods.railway.is_railway_cli_installed", lambda: True)
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: {"authenticated": True, "detail": "user@example.com"},
         )
 
         command_calls = {"count": 0}
 
-        def mock_run_command(cmd: list[str], **kwargs: object) -> object:  # noqa: ARG001
+        def mock_run_command(cmd: list[str], **kwargs: object) -> object:
             command_calls["count"] += 1
 
             class Result:
@@ -414,7 +464,7 @@ class TestDeployToRailway:
                 result.stdout = "myapp.up.railway.app"
             return result
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run_command)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run_command)
 
         result = deploy_to_railway(wait_for_health=False)
         assert result["success"] is True
@@ -422,15 +472,15 @@ class TestDeployToRailway:
 
     def test_prevalidated_auth_logs_expected_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            "app.cli.deploy.is_railway_cli_installed",
+            "app.deployment.methods.railway.is_railway_cli_installed",
             lambda: pytest.fail("CLI check should be skipped"),
         )
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: pytest.fail("Auth check should be skipped"),
         )
 
-        def mock_run_command(cmd: list[str], **kwargs: object) -> object:  # noqa: ARG001
+        def mock_run_command(cmd: list[str], **kwargs: object) -> object:
             class Result:
                 returncode = 0
                 stdout = "https://myapp.up.railway.app"
@@ -438,7 +488,7 @@ class TestDeployToRailway:
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run_command)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run_command)
 
         result = deploy_to_railway(wait_for_health=False, auth_detail="user@example.com")
         assert result["success"] is True
@@ -449,15 +499,15 @@ class TestDeployToRailway:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "app.cli.deploy.is_railway_cli_installed",
+            "app.deployment.methods.railway.is_railway_cli_installed",
             lambda: pytest.fail("CLI check should be skipped"),
         )
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: pytest.fail("Auth check should be skipped"),
         )
 
-        def mock_run_command(cmd: list[str], **kwargs: object) -> object:  # noqa: ARG001
+        def mock_run_command(cmd: list[str], **kwargs: object) -> object:
             class Result:
                 returncode = 0
                 stdout = "https://myapp.up.railway.app"
@@ -465,7 +515,7 @@ class TestDeployToRailway:
 
             return Result()
 
-        monkeypatch.setattr("app.cli.deploy._run_command", mock_run_command)
+        monkeypatch.setattr("app.deployment.methods.railway._run_command", mock_run_command)
 
         result = deploy_to_railway(wait_for_health=False, auth_detail="user@example.com")
         assert result["success"] is True
@@ -482,7 +532,9 @@ class TestRunDeploy:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: False)
+        monkeypatch.setattr(
+            "app.deployment.methods.railway.is_railway_cli_installed", lambda: False
+        )
         rc = run_deploy(target="railway", yes=True)
         assert rc == 1
 
@@ -490,18 +542,18 @@ class TestRunDeploy:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: True)
+        monkeypatch.setattr("app.deployment.methods.railway.is_railway_cli_installed", lambda: True)
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: {"authenticated": False, "detail": "Not logged in"},
         )
         rc = run_deploy(target="railway", yes=True)
         assert rc == 1
 
     def test_successful_deploy(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: True)
+        monkeypatch.setattr("app.deployment.methods.railway.is_railway_cli_installed", lambda: True)
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: {"authenticated": True, "detail": "user@example.com"},
         )
         received_kwargs: dict[str, object] = {}
@@ -516,7 +568,7 @@ class TestRunDeploy:
             }
 
         monkeypatch.setattr(
-            "app.cli.deploy.deploy_to_railway",
+            "app.deployment.methods.railway.deploy_to_railway",
             mock_deploy_to_railway,
         )
         rc = run_deploy(target="railway", yes=True)
@@ -524,13 +576,13 @@ class TestRunDeploy:
         assert received_kwargs["auth_detail"] == "user@example.com"
 
     def test_dry_run_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("app.cli.deploy.is_railway_cli_installed", lambda: True)
+        monkeypatch.setattr("app.deployment.methods.railway.is_railway_cli_installed", lambda: True)
         monkeypatch.setattr(
-            "app.cli.deploy.get_railway_auth_status",
+            "app.deployment.methods.railway.get_railway_auth_status",
             lambda: {"authenticated": True, "detail": "user@example.com"},
         )
         monkeypatch.setattr(
-            "app.cli.deploy.deploy_to_railway",
+            "app.deployment.methods.railway.deploy_to_railway",
             lambda **_kw: {
                 "success": True,
                 "url": "https://example.up.railway.app",
@@ -549,13 +601,13 @@ class TestDeployCommand:
         runner = CliRunner()
 
         with (
-            patch("app.cli.deploy.is_railway_cli_installed", return_value=True),
+            patch("app.deployment.methods.railway.is_railway_cli_installed", return_value=True),
             patch(
-                "app.cli.deploy.get_railway_auth_status",
+                "app.deployment.methods.railway.get_railway_auth_status",
                 return_value={"authenticated": True, "detail": "user@example.com"},
             ),
             patch(
-                "app.cli.deploy.deploy_to_railway",
+                "app.deployment.methods.railway.deploy_to_railway",
                 return_value={
                     "success": True,
                     "url": "https://myapp.up.railway.app",
@@ -584,12 +636,12 @@ class TestDeployCommand:
             }
 
         with (
-            patch("app.cli.deploy.is_railway_cli_installed", return_value=True),
+            patch("app.deployment.methods.railway.is_railway_cli_installed", return_value=True),
             patch(
-                "app.cli.deploy.get_railway_auth_status",
+                "app.deployment.methods.railway.get_railway_auth_status",
                 return_value={"authenticated": True, "detail": "user@example.com"},
             ),
-            patch("app.cli.deploy.deploy_to_railway", side_effect=_deploy),
+            patch("app.deployment.methods.railway.deploy_to_railway", side_effect=_deploy),
         ):
             result = runner.invoke(
                 cli,
@@ -620,13 +672,13 @@ class TestDeployCommand:
         runner = CliRunner()
 
         with (
-            patch("app.cli.deploy.is_railway_cli_installed", return_value=True),
+            patch("app.deployment.methods.railway.is_railway_cli_installed", return_value=True),
             patch(
-                "app.cli.deploy.get_railway_auth_status",
+                "app.deployment.methods.railway.get_railway_auth_status",
                 return_value={"authenticated": True, "detail": "user@example.com"},
             ),
             patch(
-                "app.cli.deploy.deploy_to_railway",
+                "app.deployment.methods.railway.deploy_to_railway",
                 return_value={
                     "success": True,
                     "url": "https://example.up.railway.app",
@@ -643,7 +695,7 @@ class TestDeployCommand:
     def test_deploy_command_missing_cli(self) -> None:
         runner = CliRunner()
 
-        with patch("app.cli.deploy.is_railway_cli_installed", return_value=False):
+        with patch("app.deployment.methods.railway.is_railway_cli_installed", return_value=False):
             result = runner.invoke(cli, ["deploy", "railway", "--yes"])
 
         assert result.exit_code == 1
@@ -653,9 +705,9 @@ class TestDeployCommand:
         runner = CliRunner()
 
         with (
-            patch("app.cli.deploy.is_railway_cli_installed", return_value=True),
+            patch("app.deployment.methods.railway.is_railway_cli_installed", return_value=True),
             patch(
-                "app.cli.deploy.get_railway_auth_status",
+                "app.deployment.methods.railway.get_railway_auth_status",
                 return_value={"authenticated": False, "detail": "Not logged in"},
             ),
         ):

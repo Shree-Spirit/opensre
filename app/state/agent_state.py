@@ -107,6 +107,15 @@ class AgentState(TypedDict, total=False):
     #         "source": str, "confidence": float}.
     incident_window: dict[str, Any] | None
 
+    # Append-only audit trail of windows replaced by ``adapt_window``. Each
+    # entry is the OLD window dict at the moment of replacement, plus
+    # ``replaced_at`` (ISO-8601) and ``replaced_reason`` (e.g.
+    # "expanded:empty_deploy_timeline"). Bounded by ``MAX_EXPANSIONS`` in
+    # the adapt_window rule layer; the field itself imposes no cap.
+    # ``None`` until the first expansion. Diagnose narratives may cite
+    # this to explain "we tried 120m, found no deploys, widened to 240m".
+    incident_window_history: list[dict[str, Any]] | None
+
     # Placeholder→original map for reversible infrastructure identifier masking
     masking_map: dict[str, str]
 
@@ -118,6 +127,9 @@ class AgentState(TypedDict, total=False):
 
     # Telegram context (when triggered from Telegram message)
     telegram_context: dict[str, Any]
+
+    # OpenClaw context (for write-back targeting / transport overrides)
+    openclaw_context: dict[str, Any]
 
     # LangGraph context (injected from config by inject_auth_node)
     thread_id: str
@@ -188,10 +200,12 @@ class AgentStateModel(StrictConfigModel):
     action_to_run: str = ""
     investigation_started_at: float = 0.0
     incident_window: dict[str, Any] | None = None
+    incident_window_history: list[dict[str, Any]] | None = None
     masking_map: dict[str, str] = Field(default_factory=dict)
     slack_context: dict[str, Any] = Field(default_factory=dict)
     discord_context: dict[str, Any] = Field(default_factory=dict)
     telegram_context: dict[str, Any] = Field(default_factory=dict)
+    openclaw_context: dict[str, Any] = Field(default_factory=dict)
     thread_id: str = ""
     run_id: str = ""
     auth_token: str = Field(default="", alias="_auth_token", exclude=True)

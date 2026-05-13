@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, TypeVar, cast, overload
+from typing import Any, cast, overload
 
 from app.tools.base import BaseTool
 from app.tools.registered_tool import REGISTERED_TOOL_ATTR, CostTier, RegisteredTool
 from app.types.evidence import EvidenceSource
 from app.types.retrieval import RetrievalControls
-
-F = TypeVar("F", bound=Callable[..., Any])
 
 
 @overload
@@ -19,6 +17,7 @@ def tool(
     *,
     name: str | None = None,
     description: str | None = None,
+    display_name: str | None = None,
     input_schema: dict[str, Any] | None = None,
     source: EvidenceSource | None = None,
     surfaces: tuple[str, ...] | None = None,
@@ -35,11 +34,12 @@ def tool(
 
 
 @overload
-def tool(  # noqa: UP047
+def tool[F: Callable[..., Any]](
     func: F,
     *,
     name: str | None = None,
     description: str | None = None,
+    display_name: str | None = None,
     input_schema: dict[str, Any] | None = None,
     source: EvidenceSource | None = None,
     surfaces: tuple[str, ...] | None = None,
@@ -56,11 +56,12 @@ def tool(  # noqa: UP047
 
 
 @overload
-def tool(  # noqa: UP047
+def tool[F: Callable[..., Any]](
     func: None = None,
     *,
     name: str | None = None,
     description: str | None = None,
+    display_name: str | None = None,
     input_schema: dict[str, Any] | None = None,
     source: EvidenceSource | None = None,
     surfaces: tuple[str, ...] | None = None,
@@ -76,11 +77,12 @@ def tool(  # noqa: UP047
     pass
 
 
-def tool(  # noqa: UP047
+def tool[F: Callable[..., Any]](
     func: F | BaseTool | None = None,
     *,
     name: str | None = None,
     description: str | None = None,
+    display_name: str | None = None,
     input_schema: dict[str, Any] | None = None,
     source: EvidenceSource | None = None,
     surfaces: tuple[str, ...] | None = None,
@@ -148,6 +150,7 @@ def tool(  # noqa: UP047
                     target,
                     name=name,
                     description=description,
+                    display_name=display_name,
                     input_schema=input_schema,
                     source=source,
                     surfaces=surfaces,
