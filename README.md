@@ -303,10 +303,10 @@ Thanks goes to these amazing people:
         </a>
     </td>
             <td align="center">
-        <a href="https://github.com/paultracer">
-            <img src="https://avatars.githubusercontent.com/u/214484440?v=4" width="100" alt="paultracer"/>
+        <a href="https://github.com/0xpaulx">
+            <img src="https://avatars.githubusercontent.com/u/214484440?v=4" width="100" alt="0xpaulx"/>
             <br />
-            <sub><b>paultracer</b></sub>
+            <sub><b>0xpaulx</b></sub>
         </a>
     </td>
 		</tr>
@@ -1011,6 +1011,15 @@ Thanks goes to these amazing people:
             <img src="https://avatars.githubusercontent.com/u/90125084?v=4" width="100" alt="Genmin"/>
             <br />
             <sub><b>Genmin</b></sub>
+        </a>
+    </td>
+		</tr>
+		<tr>
+            <td align="center">
+        <a href="https://github.com/Shree-Spirit">
+            <img src="https://avatars.githubusercontent.com/u/238940682?v=4" width="100" alt="Shree-Spirit"/>
+            <br />
+            <sub><b>Shree-Spirit</b></sub>
         </a>
     </td>
 		</tr>
