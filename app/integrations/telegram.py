@@ -27,22 +27,21 @@ def send_message(text: str) -> dict:
 
     try:
         response = requests.post(url, json=payload, timeout=5)
+        data = response.json()
 
-        # ✅ Only log safe info
-        print("Telegram status:", response.status_code)
-
-        # ✅ Handle error response
-        if response.status_code != 200:
+        if not data.get("ok"):
             return {
-                "error": "Failed to send message",
-                "status_code": response.status_code
+                "success": False,
+                "error": data
             }
 
-        return response.json()
+        return {
+            "success": True,
+            "data": data
+        }
 
     except requests.exceptions.RequestException as e:
-        # ✅ Handle network errors safely
         return {
-            "error": "Request failed",
-            "details": str(e)
+            "success": False,
+            "error": str(e)
         }

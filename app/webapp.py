@@ -2,25 +2,22 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 from fastapi import FastAPI, Header, HTTPException
-from app.integrations.telegram import send_message   # ✅ fixed import
+from app.integrations.telegram import send_message
 
 app = FastAPI()
 
 
-# ✅ Request model
 class Alert(BaseModel):
     service: str
     severity: str
     message: str
 
 
-# ✅ API key verification function (separate)
 def verify_api_key(x_api_key: str):
     if x_api_key != "my-secret-key":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# ✅ MAIN ALERT API (FIXED)
 @app.post("/alert")
 def send_alert(alert: Alert, x_api_key: str = Header(None)) -> dict:
     verify_api_key(x_api_key)
@@ -33,20 +30,14 @@ Severity: {alert.severity}
 Message: {alert.message}
 """
 
-    send_message(text)
+    result = send_message(text)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail="Failed to send alert")
+
     return {"status": "alert sent"}
 
 
-# ✅ TEST API (also protected)
-@app.get("/test-telegram")
-def test(x_api_key: str = Header(None)):
-    verify_api_key(x_api_key)
-
-    send_message("🔥 Alert from OpenSRE!")
-    return {"status": "sent"}
-
-
-# ✅ HEALTH ROUTE (important for PR)
 @app.get("/health")
-def health():
+def health() -> dict:
     return {"status": "ok"}
