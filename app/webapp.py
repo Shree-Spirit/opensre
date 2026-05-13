@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic import BaseModel
 from fastapi import FastAPI, Header, HTTPException
 from app.integrations.telegram import send_message   # ✅ fixed import
@@ -20,7 +22,7 @@ def verify_api_key(x_api_key: str):
 
 # ✅ MAIN ALERT API (FIXED)
 @app.post("/alert")
-def send_alert(alert: Alert, x_api_key: str = Header(None)):
+def send_alert(alert: Alert, x_api_key: str = Header(None)) -> dict:
     verify_api_key(x_api_key)
 
     text = f"""

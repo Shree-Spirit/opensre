@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import requests
 import os
 from dotenv import load_dotenv
@@ -15,7 +17,7 @@ if not TOKEN or not CHAT_ID:
 
 
 # ✅ Send message function
-def send_message(text: str):
+def send_message(text: str) -> dict:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
     payload = {
